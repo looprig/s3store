@@ -1,0 +1,72 @@
+// Package s3store provides S3-compatible immutable blob storage. The P2.1
+// scaffold validates and wires the client boundary; P2.2 implements I/O.
+package s3store
+
+import (
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/looprig/s3store/internal/guard"
+)
+
+type DeadlineRequiredError = guard.DeadlineRequiredError
+type NotImplementedError = guard.NotImplementedError
+
+// Store implements only storage.Blobs. Structured primitives and SessionStore
+// composition deliberately live in other modules.
+type Store struct {
+	client    *s3.Client
+	transfers *transfermanager.Client
+	options   resolvedOptions
+	// transferSlots is the Store-wide operation bound consumed by P2.2 before
+	// any SDK transfer starts.
+	transferSlots chan struct{}
+}
+
+type configLoader func(context.Context, resolvedOptions) (aws.Config, error)
+
+var loadConfig configLoader = defaultLoadConfig
+
+// Open validates configuration, requires a caller deadline, and constructs
+// lazy SDK clients. It performs no request, bucket probe, or mutation; live S3
+// setup and conformance belong to P2.2.
+func Open(ctx context.Context, options Options) (*Store, error) {
+	resolved, err := options.resolve()
+	if err != nil {
+		return nil, err
+	}
+	if err := guard.RequireDeadline(ctx, "Open"); err != nil {
+		return nil, err
+	}
+	awsConfig, err := loadConfig(ctx, resolved)
+	if err != nil {
+		// SDK configuration errors can contain provider details. Do not wrap,
+		// retain, or expose them.
+		return nil, invalidOption("Credentials", "AWS configuration could not be loaded securely")
+	}
+	client := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
+		options.BaseEndpoint = aws.String(resolved.endpoint)
+		options.UsePathStyle = resolved.addressingStyle == AddressingPath
+	})
+	transfers := transfermanager.New(client, func(options *transfermanager.Options) {
+		options.MultipartUploadThreshold = resolved.multipartThreshold
+		options.PartSizeBytes = resolved.multipartPartSize
+		options.Concurrency = resolved.concurrency
+		options.GetObjectBufferSize = int64(resolved.concurrency) * resolved.multipartPartSize
+	})
+	return &Store{
+		client: client, transfers: transfers, options: resolved,
+		transferSlots: make(chan struct{}, resolved.maxConcurrentTransfers),
+	}, nil
+}
+
+func defaultLoadConfig(ctx context.Context, options resolvedOptions) (aws.Config, error) {
+	loadOptions := []func(*config.LoadOptions) error{config.WithRegion(options.region)}
+	if options.credentials != nil {
+		loadOptions = append(loadOptions, config.WithCredentialsProvider(options.credentials))
+	}
+	return config.LoadDefaultConfig(ctx, loadOptions...)
+}
