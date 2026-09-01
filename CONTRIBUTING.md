@@ -10,7 +10,7 @@ defines the dependency, credential-redaction, transport, and testing boundaries.
 - Do not add a local `replace`, vendor dependencies, or add PostgreSQL, a logging
   framework, or another cloud SDK.
 - Write a failing test first and run it. Live service behavior belongs in an
-  `integration`-tagged test against P2.2's disposable S3-compatible fixture.
+  `integration`-tagged test against the disposable S3-compatible fixture.
 - Never put credentials, authorization headers, provider errors, or presigned
   URLs into test failure output, package errors, or logs.
 - Preserve both transfer bounds: the Store-wide operation gate and the validated
@@ -30,8 +30,8 @@ make check
 make secure
 ```
 
-P2.1's integration target has no live fixture; P2.2 owns making the Storage
-Blobs conformance suite operational against a disposable service.
+The integration target starts its own loopback-only disposable service; it
+requires no external bucket or credentials.
 
 ## Pull requests
 

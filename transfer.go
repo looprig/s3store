@@ -6,8 +6,7 @@ import (
 	"github.com/looprig/s3store/internal/guard"
 )
 
-// acquireTransfer reserves one Store-wide transfer slot and is the contract
-// P2.2 must honour before starting any SDK transfer:
+// acquireTransfer reserves one Store-wide transfer slot before SDK I/O:
 //
 //   - it requires a caller deadline, like every other operation;
 //   - it fails closed with *UnconstructedStoreError on a Store that did not

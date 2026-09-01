@@ -41,8 +41,7 @@ const (
 	AddressingPath
 )
 
-// EncryptionMode controls the server-side encryption request policy retained
-// for P2.2.
+// EncryptionMode controls the server-side encryption request policy.
 type EncryptionMode uint8
 
 const (
@@ -73,8 +72,8 @@ type Options struct {
 	MultipartThreshold int64
 	MultipartPartSize  int64
 	Concurrency        int
-	// MaxConcurrentTransfers bounds simultaneous Store operations. P2.2 uses
-	// the retained Store-wide gate before invoking the transfer manager.
+	// MaxConcurrentTransfers bounds simultaneous Store operations and live Get
+	// response bodies.
 	MaxConcurrentTransfers int
 
 	// Credentials injects a provider. Nil selects the AWS SDK's standard secure
@@ -110,7 +109,7 @@ type resolvedOptions struct {
 	// maxAccountedObjectSize is the largest object for which multipartPartSize
 	// still holds. Above it the transfer manager silently inflates part size to
 	// objectSize/maxUploadParts+1 and the transfer-memory arithmetic below stops
-	// describing reality, so P2.2 must reject larger uploads.
+	// describing reality, so Put rejects larger uploads.
 	maxAccountedObjectSize int64
 	concurrency            int
 	maxConcurrentTransfers int

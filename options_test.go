@@ -166,6 +166,50 @@ func TestDefaultTransferMemoryBudgetFitsCeiling(t *testing.T) {
 	}
 }
 
+func TestByteLengthLimitsUseBytesAtAndAboveThreshold(t *testing.T) {
+	t.Parallel()
+	options := validOptions()
+	options.DeploymentPrefix = strings.Repeat("é", maxDeploymentPrefixBytes/2)
+	_, err := options.resolve()
+	var atPrefix *OptionsError
+	if !errors.As(err, &atPrefix) || atPrefix.Field != "DeploymentPrefix" || strings.Contains(atPrefix.Reason, "256 bytes") {
+		t.Fatalf("256-byte Unicode prefix error = %#v, want canonical-grammar rejection rather than oversized", err)
+	}
+	options.DeploymentPrefix += "é"
+	_, err = options.resolve()
+	var abovePrefix *OptionsError
+	if !errors.As(err, &abovePrefix) || abovePrefix.Field != "DeploymentPrefix" || !strings.Contains(abovePrefix.Reason, "256 bytes") {
+		t.Fatalf("258-byte Unicode prefix error = %#v, want 256-byte limit", err)
+	}
+
+	options = validOptions()
+	options.Encryption = EncryptionKMS
+	options.KMSKeyID = strings.Repeat("é", maxKMSKeyIDBytes/2)
+	if _, err := options.resolve(); err != nil {
+		t.Fatalf("2048-byte Unicode KMS key: %v", err)
+	}
+	options.KMSKeyID += "x"
+	_, err = options.resolve()
+	var aboveKMS *OptionsError
+	if !errors.As(err, &aboveKMS) || aboveKMS.Field != "KMSKeyID" || !strings.Contains(aboveKMS.Reason, "2048 bytes") {
+		t.Fatalf("2049-byte Unicode KMS key error = %#v, want 2048-byte limit", err)
+	}
+}
+
+func TestTransferSizeBoundsAtThresholdOnBothSides(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int64{minMultipartBytes, maxMultipartBytes} {
+		if got, err := resolveTransferSize("size", size, 1); err != nil || got != size {
+			t.Errorf("resolveTransferSize(%d) = (%d, %v), want (%d, nil)", size, got, err, size)
+		}
+	}
+	for _, size := range []int64{minMultipartBytes - 1, maxMultipartBytes + 1} {
+		if _, err := resolveTransferSize("size", size, 1); err == nil {
+			t.Errorf("resolveTransferSize(%d) returned nil error", size)
+		}
+	}
+}
+
 // TestAccountedObjectSizeMarksThePartInflationBoundary pins the exact size at
 // which the transfer manager stops honouring the configured part size. The
 // SDK inflates when objectSize/PartSizeBytes >= MaxUploadParts; the accounted
@@ -244,6 +288,33 @@ func TestDefaultLoadConfigUsesInjectedCredentials(t *testing.T) {
 	}
 	if credentials.AccessKeyID != "not-retrieved-by-scaffold" {
 		t.Errorf("injected AccessKeyID = %q, want test provider value", credentials.AccessKeyID)
+	}
+}
+
+func TestDefaultLoadConfigPinsChecksumAndRetryPolicy(t *testing.T) {
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	resolved, err := validOptions().resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	resolved.credentials = signableCredentials{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	configuration, err := defaultLoadConfig(ctx, resolved)
+	if err != nil {
+		t.Fatalf("defaultLoadConfig: %v", err)
+	}
+	if configuration.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired {
+		t.Errorf("request checksum calculation = %v, want WhenRequired because s3store verifies full payload SHA-256", configuration.RequestChecksumCalculation)
+	}
+	if configuration.ResponseChecksumValidation != aws.ResponseChecksumValidationWhenRequired {
+		t.Errorf("response checksum validation = %v, want WhenRequired to avoid unsupported-checksum warnings from compatible services", configuration.ResponseChecksumValidation)
+	}
+	if configuration.Retryer != nil {
+		t.Fatal("custom Retryer bypasses the SDK standard classifier")
+	}
+	if attempts := configuration.RetryMaxAttempts; attempts != 3 {
+		t.Errorf("standard retry max attempts = %d, want 3", attempts)
 	}
 }
 

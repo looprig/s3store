@@ -38,29 +38,33 @@ error only.
 - Reject configurations whose accounted transfer buffers,
   `(threshold + (concurrency+1) x partSize) x maxConcurrentTransfers`, exceed
   512 MiB. This is a configuration-time bound on the SDK's steady-state pools,
-  not a runtime memory guarantee. Its three known leaks — part-size inflation
-  above `partSize x 10000`, pre-pool read amplification, and the still-unacquired
-  Store gate — are named in the README and must stay named there.
+  not a runtime memory guarantee. Pre-pool read amplification remains named in
+  the README. `Put` rejects above `partSize x 10000 - 1`, and every operation
+  acquires the Store-wide gate.
 - The Store-wide gate is only real when acquired. `acquireTransfer` requires a
   deadline, fails closed on a Store not built by `newStore` instead of blocking
-  on a nil channel, and waits in a `select` against `ctx.Done()`. P2.2 must
-  acquire it around every transfer and pair it with a deferred
-  `releaseTransfer`.
+  on a nil channel, and waits in a `select` against `ctx.Done()`. Every method
+  pairs acquisition with release; a Get reader holds its slot until terminal
+  read or Close.
 - Errors returned to callers are not automatically recordable. An invalid key
   surfaces as `*storage.InvalidNameError` retaining the key, as Storage's
   conformance suite requires. Anything that records an error must call
   `RedactedErrorText` first.
-- Deployment prefixes and logical keys are canonical Storage names. P2.2 owns
-  collision-free backend-key derivation and immutable S3 operations.
+- Deployment prefixes and logical keys are canonical Storage names. Manifest
+  object keys bind a reversible encoding to the logical key's SHA-256. Payloads
+  are uniquely staged, range-verified, and published only through a conditional
+  manifest create.
 - Every operation, including `Open`, requires a caller context deadline.
-- P2.1 performs no S3 request. Every blob operation returns a typed
-  `NotImplementedError`; nil readers and nil listings always carry that error.
+- `Open` performs no S3 request. Blob methods use the bounded standard SDK retry
+  classifier; source reads are never retried, while materialized upload parts
+  are replayable.
+- Never add a signed/public URL method. Factory authorizes logical reads and
+  streams the returned reader.
 
 ## Testing and build
 
-Unit tests require no endpoint. S3 conformance tests use the `integration` build
-tag once P2.2 adds the disposable fixture. Every Go command uses `GOWORK=off`,
-and tests always run with `-race`.
+Unit tests require no endpoint. Integration-tagged tests start the disposable
+in-process S3 fixture. Every Go command uses `GOWORK=off`, and tests always run
+with `-race`.
 
-Run `make check` before each commit and `make test-integration` when a disposable
-S3-compatible endpoint is available.
+Run `make check` and `make test-integration` before each commit.

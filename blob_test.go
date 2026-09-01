@@ -47,6 +47,15 @@ func TestStoreImplementsOnlyBlobs(t *testing.T) {
 			t.Errorf("Store implements %s; s3store is Blobs-only and claims no optional capability", interfaceCase.name)
 		}
 	}
+	typeOfStore := reflect.TypeOf((*Store)(nil))
+	var methods []string
+	for index := 0; index < typeOfStore.NumMethod(); index++ {
+		methods = append(methods, typeOfStore.Method(index).Name)
+	}
+	wantMethods := []string{"Delete", "Get", "List", "Put"}
+	if !reflect.DeepEqual(methods, wantMethods) {
+		t.Fatalf("exported Store methods = %v, want only storage.Blobs %v; signed/public URL APIs belong in Factory", methods, wantMethods)
+	}
 }
 
 func TestOpenRejectsOptionsBeforeSDKConstruction(t *testing.T) {
@@ -232,27 +241,6 @@ func TestBlobOperationsRejectNilContext(t *testing.T) {
 	}
 }
 
-func TestBlobOperationsReturnHonestNotImplementedResults(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	store := newScaffoldStore()
-
-	if err := store.Put(ctx, "blobs/key", bytes.NewReader(nil)); !isNotImplemented(err, "Blobs.Put") {
-		t.Errorf("Put error = %T %v, want Blobs.Put *NotImplementedError", err, err)
-	}
-	reader, err := store.Get(ctx, "blobs/key")
-	if reader != nil || !isNotImplemented(err, "Blobs.Get") {
-		t.Errorf("Get = (%v, %T %v), want nil, Blobs.Get *NotImplementedError", reader, err, err)
-	}
-	if err := store.Delete(ctx, "blobs/key"); !isNotImplemented(err, "Blobs.Delete") {
-		t.Errorf("Delete error = %T %v, want Blobs.Delete *NotImplementedError", err, err)
-	}
-	keys, err := store.List(ctx, "blobs/")
-	if keys != nil || !isNotImplemented(err, "Blobs.List") {
-		t.Errorf("List = (%v, %T %v), want nil, Blobs.List *NotImplementedError", keys, err, err)
-	}
-}
-
 func TestBlobOperationsValidateKeysBeforeStubResult(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -267,35 +255,30 @@ func TestBlobOperationsValidateKeysBeforeStubResult(t *testing.T) {
 	}
 	for _, operation := range operations {
 		t.Run(operation.name, func(t *testing.T) {
-			err := operation.call("../escape")
+			const invalidKey = "../escape"
+			err := operation.call(invalidKey)
 			var invalid *storage.InvalidNameError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("%s error = %T %v, want *storage.InvalidNameError", operation.name, err, err)
+			}
+			if invalid.Name != invalidKey {
+				t.Fatalf("%s InvalidNameError.Name = %q, want caller key %q", operation.name, invalid.Name, invalidKey)
 			}
 		})
 	}
 }
 
 func TestListPrefixValidation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	store := newScaffoldStore()
 	for _, prefix := range []string{"", "blobs", "blobs/"} {
-		keys, err := store.List(ctx, prefix)
-		if keys != nil || !isNotImplemented(err, "Blobs.List") {
-			t.Errorf("List(%q) = (%v, %T %v), want nil, *NotImplementedError", prefix, keys, err, err)
+		if err := validateListPrefix(prefix); err != nil {
+			t.Errorf("validateListPrefix(%q) = %v, want nil", prefix, err)
 		}
 	}
-	_, err := store.List(ctx, "../")
+	err := validateListPrefix("../")
 	var invalid *storage.InvalidNameError
 	if !errors.As(err, &invalid) {
-		t.Fatalf("List invalid prefix error = %T %v, want *storage.InvalidNameError", err, err)
+		t.Fatalf("invalid prefix error = %T %v, want *storage.InvalidNameError", err, err)
 	}
-}
-
-func isNotImplemented(err error, operation string) bool {
-	var notImplemented *NotImplementedError
-	return errors.As(err, &notImplemented) && notImplemented.Operation == operation
 }
 
 // newScaffoldStore builds a client-free Store through the package constructor,

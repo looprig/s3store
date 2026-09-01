@@ -74,6 +74,15 @@ func TestRedactedErrorTextClassifiesPackageErrors(t *testing.T) {
 	if got := RedactedErrorText(&UnconstructedStoreError{Operation: "Blobs.Put"}); !strings.Contains(got, "Blobs.Put") {
 		t.Errorf("UnconstructedStoreError text = %q, want the operation name", got)
 	}
+	for _, packageErr := range []error{
+		&BackendError{Operation: "payload upload"},
+		&BlobIntegrityError{Operation: "payload digest"},
+		&ObjectTooLargeError{Maximum: 42},
+	} {
+		if got := RedactedErrorText(packageErr); got != packageErr.Error() {
+			t.Errorf("RedactedErrorText(%T) = %q, want the typed classification %q", packageErr, got, packageErr.Error())
+		}
+	}
 }
 
 // TestRedactedErrorTextFailsClosedOnUnknownErrors is the important half: an

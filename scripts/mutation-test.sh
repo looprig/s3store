@@ -5,8 +5,9 @@ group=${1:-all}
 shard=${2:-0}
 shards=${3:-1}
 mutation_index=0
+killed=0
 snapshot_dir="/private/tmp/s3store-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go s3store.go blob.go key.go transfer.go redact.go internal/guard/guard.go"
+files="go.mod options.go s3store.go blob.go blob_io.go manifest.go key.go transfer.go redact.go blob_test.go internal/guard/guard.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -38,6 +39,7 @@ run_mutation() {
 	new=$5
 	test_name=$6
 	want=$7
+	tags=${8:-}
 
 	if test "$group" != all && test "$group" != "$mutation_group"; then
 		return
@@ -48,7 +50,7 @@ run_mutation() {
 		return
 	fi
 	restore_snapshot
-	GOWORK=off GOCACHE=/private/tmp/s3store-gocache go test -list "^${test_name}$" . | grep -qx "$test_name"
+	GOWORK=off GOCACHE=/private/tmp/s3store-gocache go test $tags -list "^${test_name}$" . | grep -qx "$test_name"
 	if ! grep -Fq "$old" "$file"; then
 		echo "mutation pattern not found: $name"
 		exit 1
@@ -56,7 +58,7 @@ run_mutation() {
 	MUT_OLD=$old MUT_NEW=$new perl -0pi -e 's/\Q$ENV{"MUT_OLD"}\E/$ENV{"MUT_NEW"}/' "$file"
 
 	set +e
-	output=$(GOWORK=off GOCACHE=/private/tmp/s3store-gocache go test -run "^${test_name}$" -count=1 . 2>&1)
+	output=$(GOWORK=off GOCACHE=/private/tmp/s3store-gocache go test $tags -run "^${test_name}$" -count=1 . 2>&1)
 	status=$?
 	set -e
 	if test "$status" -eq 0; then
@@ -74,6 +76,7 @@ run_mutation() {
 		exit 1
 	fi
 	echo "KILLED|$name|$test_name|$want"
+	killed=$((killed + 1))
 }
 
 run_mutation options "missing endpoint" options.go 'if strings.TrimSpace(raw) == "" {' 'if false && strings.TrimSpace(raw) == "" {' TestOptionsResolve 'reason containing "must be set"'
@@ -147,7 +150,10 @@ run_mutation open "transfer concurrency bound" s3store.go 'options.Concurrency =
 run_mutation open "Get buffer bound" s3store.go 'options.GetObjectBufferSize = int64(resolved.concurrency) * resolved.multipartPartSize' 'options.GetObjectBufferSize = int64(resolved.concurrency+1) * resolved.multipartPartSize' TestOpenWiresBlobScaffoldWithoutNetworkIO 'transfer Get buffer ='
 run_mutation open "Store-wide transfer gate" s3store.go 'make(chan struct{}, resolved.maxConcurrentTransfers)' 'make(chan struct{}, resolved.maxConcurrentTransfers+1)' TestOpenWiresBlobScaffoldWithoutNetworkIO 'Store transfer slots ='
 run_mutation open "injected credential provider" s3store.go 'if options.credentials != nil {' 'if false && options.credentials != nil {' TestDefaultLoadConfigUsesInjectedCredentials 'Retrieve:'
-run_mutation open "standard credential chain" s3store.go 'loadOptions := []func(*config.LoadOptions) error{config.WithRegion(options.region)}' 'loadOptions := []func(*config.LoadOptions) error{config.WithRegion(options.region), config.WithCredentialsProvider(aws.AnonymousCredentials{})}' TestDefaultLoadConfigUsesStandardCredentialChain 'standard credential chain Retrieve:'
+run_mutation open "standard credential chain" s3store.go 'config.WithRegion(options.region),' 'config.WithRegion(options.region), config.WithCredentialsProvider(aws.AnonymousCredentials{}),' TestDefaultLoadConfigUsesStandardCredentialChain 'standard credential chain Retrieve:'
+run_mutation open "request checksum policy" s3store.go 'config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),' 'config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenSupported),' TestDefaultLoadConfigPinsChecksumAndRetryPolicy 'request checksum calculation ='
+run_mutation open "response checksum policy" s3store.go 'config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),' 'config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenSupported),' TestDefaultLoadConfigPinsChecksumAndRetryPolicy 'response checksum validation ='
+run_mutation open "bounded standard retry attempts" s3store.go 'config.WithRetryMaxAttempts(3),' 'config.WithRetryMaxAttempts(4),' TestDefaultLoadConfigPinsChecksumAndRetryPolicy 'standard retry max attempts = 4, want 3'
 
 run_mutation security "endpoint userinfo redaction" options.go 'invalidOption("Endpoint", "must not contain userinfo")' 'invalidOption("Endpoint", "must not contain userinfo: "+raw)' TestOptionsErrorNeverUnwrapsOrRetainsSensitiveValue 'want non-unwrapping redacted error'
 run_mutation security "presigned query redaction" options.go 'invalidOption("Endpoint", "must not contain a query")' 'invalidOption("Endpoint", "must not contain a query: "+raw)' TestOptionsResolve 'error disclosed credential material "super-secret"'
@@ -155,13 +161,12 @@ run_mutation security "KMS identifier redaction" options.go 'invalidOption("KMSK
 
 run_mutation blob "nil context" internal/guard/guard.go 'if ctx == nil {' 'if false && ctx == nil {' TestBlobOperationsRejectNilContext 'panic:'
 run_mutation blob "context deadline" internal/guard/guard.go 'if _, ok := ctx.Deadline(); !ok {' 'if _, ok := ctx.Deadline(); ok && false {' TestOpenRequiresDeadline 'Open returned a Store without a caller deadline'
-run_mutation blob "blob key validation" key.go 'return storage.ValidateName(key)' 'return nil' TestBlobOperationsValidateKeysBeforeStubResult 'want *storage.InvalidNameError'
-run_mutation blob "empty list prefix" key.go 'if prefix == "" {' 'if false && prefix == "" {' TestListPrefixValidation 'List("")'
-run_mutation blob "list trailing slash" key.go 'strings.TrimSuffix(prefix, "/")' 'strings.TrimSuffix(prefix, "\\x00")' TestListPrefixValidation 'List("blobs/")'
+run_mutation blob "blob key validation" key.go 'return storage.ValidateName(key)' 'return nil' TestBlobOperationsValidateKeysBeforeStubResult 'InvalidNameError.Name ='
+run_mutation blob "empty list prefix" key.go 'if prefix == "" {' 'if false && prefix == "" {' TestListPrefixValidation 'validateListPrefix("")'
+run_mutation blob "list trailing slash" key.go 'strings.TrimSuffix(prefix, "/")' 'strings.TrimSuffix(prefix, "\\x00")' TestListPrefixValidation 'validateListPrefix("blobs/")'
 
 for operation in Put Get Delete List; do
-	run_mutation blob "$operation deadline call" blob.go "guard.RequireDeadline(ctx, \"Blobs.$operation\")" "guard.NotImplemented(\"Blobs.$operation\")" TestBlobOperationMethodsCallScaffoldGuards 'does not call guard.RequireDeadline'
-	run_mutation blob "$operation honest stub" blob.go "guard.NotImplemented(\"Blobs.$operation\")" "guard.RequireDeadline(ctx, \"Blobs.$operation\")" TestBlobOperationMethodsCallScaffoldGuards 'does not call guard.NotImplemented'
+	run_mutation blob "$operation deadline call" blob.go "guard.RequireDeadline(ctx, \"Blobs.$operation\")" "guard.NotImplemented(\"Blobs.$operation\")" TestBlobOperationMethodsCallDeadlineGuard 'does not call guard.RequireDeadline'
 done
 
 run_mutation deps "replace directive" go.mod 'go 1.26.6' 'go 1.26.6
@@ -200,44 +205,17 @@ run_mutation gate "transfer gate release" transfer.go 'func (s *Store) releaseTr
 # byte-identical to Blobs.Delete, so only Append/Read/Tip need adding. KV and
 # OrderedIndex are not reachable -- both redeclare Get -- so three of the five
 # exclusions are mutation-proved and two are compile-time impossibilities.
-run_mutation interfaces "Ledger exclusion" key.go 'import (
-	"strings"
-
-	"github.com/looprig/storage"
-)' 'import (
-	"context"
-	"strings"
-
-	"github.com/looprig/storage"
-)
-
-func (s *Store) Append(context.Context, string, uint64, []byte) error { return nil }
+run_mutation interfaces "Ledger exclusion" blob.go '// Put stages' 'func (s *Store) Append(context.Context, string, uint64, []byte) error { return nil }
 func (s *Store) Read(context.Context, string, uint64) (storage.Cursor, error) { return nil, nil }
-func (s *Store) Tip(context.Context, string) (uint64, error) { return 0, nil }' TestStoreImplementsOnlyBlobs 'Store implements storage.Ledger'
-run_mutation interfaces "Leaser exclusion" key.go 'import (
-	"strings"
+func (s *Store) Tip(context.Context, string) (uint64, error) { return 0, nil }
 
-	"github.com/looprig/storage"
-)' 'import (
-	"context"
-	"strings"
+// Put stages' TestStoreImplementsOnlyBlobs 'Store implements storage.Ledger'
+run_mutation interfaces "Leaser exclusion" blob.go '// Put stages' 'func (s *Store) Acquire(context.Context, string) (storage.Lease, error) { return nil, nil }
 
-	"github.com/looprig/storage"
-)
+// Put stages' TestStoreImplementsOnlyBlobs 'Store implements storage.Leaser'
+run_mutation interfaces "BlobReaderLifecycle exclusion" blob_test.go '// TestStoreImplementsOnlyBlobs asserts' 'func (s *Store) BlobReaderCloseBound() time.Duration { return time.Second }
 
-func (s *Store) Acquire(context.Context, string) (storage.Lease, error) { return nil, nil }' TestStoreImplementsOnlyBlobs 'Store implements storage.Leaser'
-run_mutation interfaces "BlobReaderLifecycle exclusion" key.go 'import (
-	"strings"
-
-	"github.com/looprig/storage"
-)' 'import (
-	"strings"
-	"time"
-
-	"github.com/looprig/storage"
-)
-
-func (s *Store) BlobReaderCloseBound() time.Duration { return time.Second }' TestStoreImplementsOnlyBlobs 'Store implements storage.BlobReaderLifecycle'
+// TestStoreImplementsOnlyBlobs asserts' TestStoreImplementsOnlyBlobs 'Store implements storage.BlobReaderLifecycle'
 
 run_mutation security "invalid-name key redaction" redact.go 'return "s3store: invalid storage name: " + invalidName.Rule' 'return err.Error()' TestRedactedErrorTextDropsTenantScopedIdentifiers 'recorded text disclosed'
 run_mutation security "classification survives wrapping" redact.go 'var invalidName *storage.InvalidNameError
@@ -245,6 +223,9 @@ run_mutation security "classification survives wrapping" redact.go 'var invalidN
 run_mutation security "unclassified error fails closed" redact.go 'return redactedText
 }' 'return err.Error()
 }' TestRedactedErrorTextFailsClosedOnUnknownErrors 'unclassified error text ='
+run_mutation security "backend error classification" redact.go 'if errors.As(err, &backend) {' 'if false && errors.As(err, &backend) {' TestRedactedErrorTextClassifiesPackageErrors 'RedactedErrorText(*s3store.BackendError) ='
+run_mutation security "integrity error classification" redact.go 'if errors.As(err, &integrity) {' 'if false && errors.As(err, &integrity) {' TestRedactedErrorTextClassifiesPackageErrors 'RedactedErrorText(*s3store.BlobIntegrityError) ='
+run_mutation security "object-size error classification" redact.go 'if errors.As(err, &tooLarge) {' 'if false && errors.As(err, &tooLarge) {' TestRedactedErrorTextClassifiesPackageErrors 'RedactedErrorText(*s3store.ObjectTooLargeError) ='
 
 run_mutation deps "standard stream write" s3store.go '	"github.com/looprig/s3store/internal/guard"
 )' '	"github.com/looprig/s3store/internal/guard"
@@ -258,6 +239,68 @@ run_mutation deps "builtin println" s3store.go 'func defaultLoadConfig' 'func pr
 
 func defaultLoadConfig' TestDependencyBoundary 'calls the builtin println'
 
+# P2.2 key derivation and per-row decoding.
+run_mutation keys "manifest deployment prefix validation" key.go 'if err := storage.ValidateName(deploymentPrefix); err != nil {
+		return "", err
+	}' 'if err := storage.ValidateName(deploymentPrefix); false && err != nil {
+		return "", err
+	}' TestBackendManifestKeyRejectsPrefixAndObjectInjection 'want *storage.InvalidNameError'
+run_mutation keys "manifest logical key validation" key.go 'if err := storage.ValidateName(logicalKey); err != nil {
+		return "", err
+	}' 'if err := storage.ValidateName(logicalKey); false && err != nil {
+		return "", err
+	}' TestBackendManifestKeyRejectsPrefixAndObjectInjection 'want *storage.InvalidNameError'
+run_mutation keys "manifest logical hash" key.go 'digest := sha256.Sum256([]byte(logicalKey))' 'digest := sha256.Sum256([]byte("wrong"))' TestBackendManifestKeyIsCanonicalAndReversible 'want versioned prefix and hash/encoding suffix'
+run_mutation keys "S3 object-key maximum" key.go 'if len(objectKey) > maxS3ObjectKeyBytes {' 'if false && len(objectKey) > maxS3ObjectKeyBytes {' TestLogicalObjectKeyMaximumOnBothSides 'want *OptionsError'
+run_mutation keys "listed row hash binding" key.go 'if !equalDigest(digest, want[:]) {' 'if false && !equalDigest(digest, want[:]) {' TestLogicalKeyFromManifestObjectFailsClosedPerRow 'decoded rows ='
+
+# P2.2 strict manifest framing.
+run_mutation manifest "manifest negative size encode" manifest.go 'if manifest.Size < 0 {' 'if false && manifest.Size < 0 {' TestManifestEncodeRejectsInvalidFields 'encodeManifest returned nil error'
+run_mutation manifest "manifest maximum read bound" manifest.go 'contentLength > int64(maxManifestBytes)' 'false && contentLength > int64(maxManifestBytes)' TestManifestDecodeRejectsAmbiguousOrCorruptObjects 'want *BlobIntegrityError'
+run_mutation manifest "manifest trailing byte" manifest.go 'if n, _ := reader.Read(trailing[:]); n != 0 {' 'if n, _ := reader.Read(trailing[:]); false && n != 0 {' TestManifestDecodeRejectsAmbiguousOrCorruptObjects 'want *BlobIntegrityError'
+run_mutation manifest "manifest magic" manifest.go 'if string(encoded[:8]) != manifestMagic {' 'if false && string(encoded[:8]) != manifestMagic {' TestManifestDecodeRejectsAmbiguousOrCorruptObjects 'want *BlobIntegrityError'
+run_mutation manifest "manifest exact framing length" manifest.go 'if manifestHeaderBytes+logicalLength+payloadLength != len(encoded) {' 'if false && manifestHeaderBytes+logicalLength+payloadLength != len(encoded) {' TestManifestDecodeRejectsAmbiguousOrCorruptObjects 'panic:'
+run_mutation manifest "manifest decoded size sign" manifest.go 'if rawSize > math.MaxInt64 {' 'if false && rawSize > math.MaxInt64 {' TestManifestDecodeRejectsAmbiguousOrCorruptObjects 'want *BlobIntegrityError'
+
+# P2.2 streaming accounting and terminal read verification.
+run_mutation stream "upload maximum fence" blob_io.go 'return &accountedHashReader{source: source, maximum: maximum, hash: sha256.New()}' 'return &accountedHashReader{source: source, maximum: maximum + 1, hash: sha256.New()}' TestAccountedHashReaderDrivesMaxObjectSizeOnBothSides 'read bytes ='
+run_mutation stream "upload excess-byte probe" blob_io.go 'if n > 0 {
+			return 0, &ObjectTooLargeError{Maximum: r.maximum}
+		}' 'if false && n > 0 {
+			return 0, &ObjectTooLargeError{Maximum: r.maximum}
+		}' TestAccountedHashReaderDrivesMaxObjectSizeOnBothSides 'ObjectTooLarge=false want true'
+run_mutation stream "upload streamed digest" blob_io.go 'r.hash.Write(buffer[:n])' 'r.hash.Write(buffer[:0])' TestAccountedHashReaderDrivesMaxObjectSizeOnBothSides 'digest ='
+run_mutation stream "download excess-byte probe" blob_io.go 'if n > 0 {
+			r.terminal = integrityError("payload read")' 'if false && n > 0 {
+			r.terminal = integrityError("payload read")' TestVerifyingBlobReaderRequiresExactLengthAndDigest 'integrity=false want true'
+run_mutation stream "download exact length" blob_io.go 'if r.read != r.expectedSize {' 'if false && r.read != r.expectedSize {' TestVerifyingBlobReaderRequiresExactLengthAndDigest 'integrity=false want true'
+run_mutation stream "download digest" blob_io.go 'if !equalDigest(actual[:], r.expectedDigest[:]) {' 'if false && !equalDigest(actual[:], r.expectedDigest[:]) {' TestVerifyingBlobReaderRequiresExactLengthAndDigest 'integrity=false want true'
+
+# P2.2 live atomic protocol. These mutations compile the integration suite and
+# are run against its disposable loopback service.
+run_mutation protocol "Put resolved maximum" blob.go 'newAccountedHashReader(source, s.options.maxAccountedObjectSize)' 'newAccountedHashReader(source, s.options.maxAccountedObjectSize + 1)' TestPutRejectsResolvedMaxAccountedObjectSizeOnBothSides 'want *ObjectTooLargeError' -tags=integration
+run_mutation protocol "committed payload verification" blob.go 'if err := s.verifyPayload(ctx, payloadKey, size, digest); err != nil {' 'if err := error(nil); err != nil {' TestPutVerifiesCommittedLengthAndDigestBeforePublishing 'want *BlobIntegrityError' -tags=integration
+run_mutation protocol "atomic manifest create" blob.go 'ContentLength: aws.Int64(int64(len(encoded))), IfNoneMatch: aws.String("*"),' 'ContentLength: aws.Int64(int64(len(encoded))), IfNoneMatch: nil,' TestConcurrentPutIsAtomicAndImmutable 'concurrent outcomes =' -tags=integration
+run_mutation protocol "payload committed length" blob.go 'if head.ContentLength == nil || *head.ContentLength != size {' 'if false && (head.ContentLength == nil || *head.ContentLength != size) {' TestPutVerifiesCommittedLengthAndDigestBeforePublishing 'want *BlobIntegrityError' -tags=integration
+run_mutation protocol "payload committed digest" blob.go 'if !equalDigest(actual[:], digest[:]) {' 'if false && !equalDigest(actual[:], digest[:]) {' TestPutVerifiesCommittedLengthAndDigestBeforePublishing 'want *BlobIntegrityError' -tags=integration
+run_mutation protocol "bounded verification range" blob.go 'end := min(offset+verificationRangeBytes-1, size-1)' 'end := min(offset+verificationRangeBytes, size-1)' TestPayloadVerificationRangesAreBoundedAtEnds 'Put: s3store: blob integrity verification failed during payload verification digest' -tags=integration
+run_mutation protocol "immutable range ETag" blob.go 'Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, end)), IfMatch: head.ETag,' 'Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, end)), IfMatch: nil,' TestPayloadVerificationRangesAreBoundedAtEnds 'want the same non-empty HEAD ETag' -tags=integration
+run_mutation protocol "list every page" blob.go 'if !aws.ToBool(output.IsTruncated) {' 'if true || !aws.ToBool(output.IsTruncated) {' TestListPagesPastMalformedRow 'List =' -tags=integration
+run_mutation protocol "Get holds transfer slot" blob.go 'release = false' 'release = true' TestOpenGetReaderHoldsTransferSlotUntilClose 'want context.DeadlineExceeded' -tags=integration
+run_mutation protocol "conflict digest comparison" blob.go 'left.Size == right.Size && equalDigest(left.Digest[:], right.Digest[:])' 'left.Size == right.Size' TestBlobsIntegrationConformance 'want *BlobConflictError' -tags=integration
+run_mutation protocol "unowned payload cleanup exclusion" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {' 'if !payloadOwned && !cleanupSafe && ctx.Err() == nil {' TestPutNeverDeletesPayloadItDidNotCreate 'want 0 for a payload this writer never created' -tags=integration
+run_mutation protocol "ambiguous manifest payload preservation" blob.go 'cleanupSafe = false
+	created, publishErr := s.publishManifest' 'cleanupSafe = true
+	created, publishErr := s.publishManifest' TestPutPreservesPayloadWhenManifestPublicationIsAmbiguous 'blob integrity verification failed during payload lookup' -tags=integration
+run_mutation protocol "cleanup caller deadline" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {
+			s.deletePayloadBestEffort(ctx, payloadKey)
+		}' 'if payloadOwned && cleanupSafe {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5_000_000_000)
+			defer cancel()
+			s.deletePayloadBestEffort(cleanupCtx, payloadKey)
+		}' TestPutVerificationCancellationDoesNotStartDetachedCleanup 'detached cleanup outlived the caller deadline' -tags=integration
+
 restore_snapshot
 rm -rf "$snapshot_dir"
 trap - EXIT HUP INT TERM
+echo "MEASURED|$killed|killed mutations"

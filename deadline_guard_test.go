@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestBlobOperationMethodsCallScaffoldGuards(t *testing.T) {
+func TestBlobOperationMethodsCallDeadlineGuard(t *testing.T) {
 	t.Parallel()
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "blob.go", nil, 0)
@@ -24,11 +24,9 @@ func TestBlobOperationMethodsCallScaffoldGuards(t *testing.T) {
 			continue
 		}
 		operations++
-		for _, guardName := range []string{"RequireDeadline", "NotImplemented"} {
-			if !callsGuard(function.Body, guardName) {
-				position := fileSet.Position(function.Pos())
-				t.Errorf("blob.go:%d %s does not call guard.%s", position.Line, function.Name.Name, guardName)
-			}
+		if !callsGuard(function.Body, "RequireDeadline") {
+			position := fileSet.Position(function.Pos())
+			t.Errorf("blob.go:%d %s does not call guard.RequireDeadline", position.Line, function.Name.Name)
 		}
 	}
 	if operations != 4 {

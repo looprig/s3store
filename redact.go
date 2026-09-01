@@ -45,6 +45,18 @@ func RedactedErrorText(err error) string {
 	if errors.As(err, &unconstructed) {
 		return unconstructed.Error()
 	}
+	var backend *BackendError
+	if errors.As(err, &backend) {
+		return backend.Error()
+	}
+	var integrity *BlobIntegrityError
+	if errors.As(err, &integrity) {
+		return integrity.Error()
+	}
+	var tooLarge *ObjectTooLargeError
+	if errors.As(err, &tooLarge) {
+		return tooLarge.Error()
+	}
 
 	// InvalidNameError deliberately retains the offending key. Keep the
 	// grammar rule, which is a fixed vocabulary, and drop the key.
