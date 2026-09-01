@@ -2,6 +2,7 @@ package s3store
 
 import (
 	"encoding/json"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -74,11 +75,35 @@ func TestDependencyBoundary(t *testing.T) {
 		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		fileSet := token.NewFileSet()
+		file, err := parser.ParseFile(fileSet, path, nil, 0)
 		if err != nil {
 			return err
 		}
 		parsed++
+		// A logging import is only the most obvious way to emit. Writing to
+		// the process's standard streams, directly or through fmt.Fprint*,
+		// leaks exactly as well, so the guard is over output channels rather
+		// than over one package name.
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.SelectorExpr:
+				qualifier, ok := typed.X.(*ast.Ident)
+				if ok && qualifier.Name == "os" && (typed.Sel.Name == "Stdout" || typed.Sel.Name == "Stderr") {
+					position := fileSet.Position(typed.Pos())
+					t.Errorf("%s:%d writes to os.%s; credentials, keys, and presigned URLs must reach no output stream",
+						path, position.Line, typed.Sel.Name)
+				}
+			case *ast.CallExpr:
+				callee, ok := typed.Fun.(*ast.Ident)
+				if ok && (callee.Name == "print" || callee.Name == "println") {
+					position := fileSet.Position(typed.Pos())
+					t.Errorf("%s:%d calls the builtin %s; credentials, keys, and presigned URLs must reach no output stream",
+						path, position.Line, callee.Name)
+				}
+			}
+			return true
+		})
 		for _, spec := range file.Imports {
 			importPath, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {

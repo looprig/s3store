@@ -14,6 +14,7 @@ import (
 
 type DeadlineRequiredError = guard.DeadlineRequiredError
 type NotImplementedError = guard.NotImplementedError
+type UnconstructedStoreError = guard.UnconstructedStoreError
 
 // Store implements only storage.Blobs. Structured primitives and SessionStore
 // composition deliberately live in other modules.
@@ -56,11 +57,23 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		options.PartSizeBytes = resolved.multipartPartSize
 		options.Concurrency = resolved.concurrency
 		options.GetObjectBufferSize = int64(resolved.concurrency) * resolved.multipartPartSize
+		// Pin the part ceiling instead of inheriting the SDK default, so
+		// resolved.maxAccountedObjectSize is derived from a value this module
+		// chose. Above that size the SDK inflates PartSizeBytes regardless.
+		options.MaxUploadParts = maxUploadParts
 	})
+	return newStore(client, transfers, resolved), nil
+}
+
+// newStore is the only constructor of Store. Building a Store any other way
+// leaves transferSlots nil, and a send on a nil channel blocks forever, so the
+// invariant is enforced by TestStoreIsBuiltOnlyByItsConstructor rather than
+// left to convention.
+func newStore(client *s3.Client, transfers *transfermanager.Client, resolved resolvedOptions) *Store {
 	return &Store{
 		client: client, transfers: transfers, options: resolved,
 		transferSlots: make(chan struct{}, resolved.maxConcurrentTransfers),
-	}, nil
+	}
 }
 
 func defaultLoadConfig(ctx context.Context, options resolvedOptions) (aws.Config, error) {

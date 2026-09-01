@@ -24,6 +24,11 @@ const (
 	maxConcurrentTransfers              = 32
 	maxAggregateTransferMemory    int64 = 512 << 20
 	maxKMSKeyIDBytes                    = 2048
+	// maxUploadParts is the transfer manager's hard ceiling on parts per
+	// upload; it rejects any value above it. It is pinned here rather than
+	// inherited so the accounted part size below is derived from a value this
+	// module chose.
+	maxUploadParts int64 = 10000
 )
 
 // AddressingStyle selects how bucket names are placed into S3 requests.
@@ -37,12 +42,19 @@ const (
 )
 
 // EncryptionMode controls the server-side encryption request policy retained
-// for P2.2. EncryptionBucketDefault relies on an externally enforced bucket
-// policy; P2.3 verifies that policy against live services.
+// for P2.2.
 type EncryptionMode uint8
 
 const (
-	EncryptionBucketDefault EncryptionMode = iota
+	// EncryptionUnspecified is the zero value and is always rejected. An unset
+	// field must not read as an accepted encryption posture and must not
+	// license Open to succeed; the caller states the posture explicitly.
+	EncryptionUnspecified EncryptionMode = iota
+	// EncryptionBucketDefault delegates to an externally enforced bucket
+	// policy. P2.1 and P2.2 cannot confirm that policy; P2.3 owns verifying it
+	// against a live service and failing startup when it cannot be confirmed.
+	// Until then this mode is a declared intent, not a guarantee.
+	EncryptionBucketDefault
 	EncryptionAES256
 	EncryptionKMS
 )
@@ -86,15 +98,20 @@ func (e *OptionsError) Error() string {
 }
 
 type resolvedOptions struct {
-	endpoint               string
-	region                 string
-	bucket                 string
-	deploymentPrefix       string
-	addressingStyle        AddressingStyle
-	encryption             EncryptionMode
-	kmsKeyID               string
-	multipartThreshold     int64
-	multipartPartSize      int64
+	endpoint           string
+	region             string
+	bucket             string
+	deploymentPrefix   string
+	addressingStyle    AddressingStyle
+	encryption         EncryptionMode
+	kmsKeyID           string
+	multipartThreshold int64
+	multipartPartSize  int64
+	// maxAccountedObjectSize is the largest object for which multipartPartSize
+	// still holds. Above it the transfer manager silently inflates part size to
+	// objectSize/maxUploadParts+1 and the transfer-memory arithmetic below stops
+	// describing reality, so P2.2 must reject larger uploads.
+	maxAccountedObjectSize int64
 	concurrency            int
 	maxConcurrentTransfers int
 	credentials            aws.CredentialsProvider
@@ -128,6 +145,9 @@ func (o Options) resolve() (resolvedOptions, error) {
 	}
 	if o.AddressingStyle > AddressingPath {
 		return resolvedOptions{}, invalidOption("AddressingStyle", "has an unknown mode")
+	}
+	if o.Encryption == EncryptionUnspecified {
+		return resolvedOptions{}, invalidOption("Encryption", "must be set explicitly; the zero value is not an accepted posture")
 	}
 	if o.Encryption > EncryptionKMS {
 		return resolvedOptions{}, invalidOption("Encryption", "has an unknown mode")
@@ -178,9 +198,18 @@ func (o Options) resolve() (resolvedOptions, error) {
 		deploymentPrefix: o.DeploymentPrefix, addressingStyle: o.AddressingStyle,
 		encryption: o.Encryption, kmsKeyID: o.KMSKeyID,
 		multipartThreshold: threshold, multipartPartSize: partSize,
-		concurrency: concurrency, maxConcurrentTransfers: maxTransfers,
+		maxAccountedObjectSize: accountedObjectSize(partSize),
+		concurrency:            concurrency, maxConcurrentTransfers: maxTransfers,
 		credentials: o.Credentials,
 	}, nil
+}
+
+// accountedObjectSize returns the largest object size that does not trigger the
+// transfer manager's part-size inflation. Inflation fires when
+// objectSize/partSize >= maxUploadParts, so the last safe size is one byte
+// below that product.
+func accountedObjectSize(partSize int64) int64 {
+	return partSize*maxUploadParts - 1
 }
 
 func invalidOption(field, reason string) *OptionsError {

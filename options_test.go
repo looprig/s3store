@@ -34,6 +34,11 @@ func TestOptionsResolve(t *testing.T) {
 		{name: "endpoint fragment", mutate: func(o *Options) { o.Endpoint = "https://s3.example.test/#super-secret" }, wantField: "Endpoint", wantReason: "fragment"},
 		{name: "endpoint path", mutate: func(o *Options) { o.Endpoint = "https://s3.example.test/base" }, wantField: "Endpoint", wantReason: "root path"},
 		{name: "remote plaintext", mutate: func(o *Options) { o.Endpoint = "http://s3.example.test" }, wantField: "Endpoint", wantReason: "HTTPS"},
+		// The security-relevant quadrant: a loopback host is still plaintext, and
+		// nothing but the explicit opt-in may accept it.
+		{name: "loopback plaintext without opt-in", mutate: func(o *Options) { o.Endpoint = "http://127.0.0.1:9000" }, wantField: "Endpoint", wantReason: "HTTPS"},
+		{name: "localhost plaintext without opt-in", mutate: func(o *Options) { o.Endpoint = "http://localhost:9000" }, wantField: "Endpoint", wantReason: "HTTPS"},
+		{name: "ipv6 loopback plaintext without opt-in", mutate: func(o *Options) { o.Endpoint = "http://[::1]:9000" }, wantField: "Endpoint", wantReason: "HTTPS"},
 		{name: "unsupported endpoint scheme", mutate: func(o *Options) { o.Endpoint = "ftp://s3.example.test" }, wantField: "Endpoint", wantReason: "HTTPS"},
 		{name: "missing region", mutate: func(o *Options) { o.Region = "" }, wantField: "Region", wantReason: "must be set"},
 		{name: "invalid region", mutate: func(o *Options) { o.Region = "us east/1" }, wantField: "Region", wantReason: "letters"},
@@ -55,6 +60,9 @@ func TestOptionsResolve(t *testing.T) {
 		{name: "oversized deployment prefix", mutate: func(o *Options) { o.DeploymentPrefix = strings.Repeat("a", maxDeploymentPrefixBytes+1) }, wantField: "DeploymentPrefix", wantReason: "256 bytes"},
 		{name: "unknown addressing style", mutate: func(o *Options) { o.AddressingStyle = AddressingStyle(99) }, wantField: "AddressingStyle", wantReason: "unknown"},
 		{name: "unknown encryption", mutate: func(o *Options) { o.Encryption = EncryptionMode(99) }, wantField: "Encryption", wantReason: "unknown"},
+		// F6: an absent value must not present itself as an accepted posture.
+		{name: "unset encryption", mutate: func(o *Options) { o.Encryption = EncryptionUnspecified }, wantField: "Encryption", wantReason: "must be set explicitly"},
+		{name: "zero-value encryption field", mutate: func(o *Options) { o.Encryption = Options{}.Encryption }, wantField: "Encryption", wantReason: "must be set explicitly"},
 		{name: "KMS missing key", mutate: func(o *Options) { o.Encryption = EncryptionKMS }, wantField: "KMSKeyID", wantReason: "must be set"},
 		{name: "KMS key on default encryption", mutate: func(o *Options) { o.KMSKeyID = "alias/secret-key" }, wantField: "KMSKeyID", wantReason: "only"},
 		{name: "KMS key control byte", mutate: func(o *Options) { o.Encryption = EncryptionKMS; o.KMSKeyID = "alias/key\nsecret" }, wantField: "KMSKeyID", wantReason: "control"},
@@ -153,6 +161,44 @@ func TestDefaultTransferMemoryBudgetFitsCeiling(t *testing.T) {
 	aggregate := perTransfer * int64(resolved.maxConcurrentTransfers)
 	if aggregate > maxAggregateTransferMemory {
 		t.Fatalf("default worst-case transfer memory = %d MiB, exceeds %d MiB ceiling", aggregate>>20, maxAggregateTransferMemory>>20)
+	}
+}
+
+// TestAccountedObjectSizeMarksThePartInflationBoundary pins the exact size at
+// which the transfer manager stops honouring the configured part size. The
+// SDK inflates when objectSize/PartSizeBytes >= MaxUploadParts; the accounted
+// bound is the last size below that, and the transfer-memory arithmetic is a
+// configuration-time bound only for objects at or under it.
+func TestAccountedObjectSizeMarksThePartInflationBoundary(t *testing.T) {
+	t.Parallel()
+	for _, partSize := range []int64{minMultipartBytes, defaultMultipartPartSize, maxMultipartBytes} {
+		accounted := accountedObjectSize(partSize)
+		if accounted/partSize >= maxUploadParts {
+			t.Errorf("part size %d: accounted object size %d already inflates (%d parts >= %d)",
+				partSize, accounted, accounted/partSize, maxUploadParts)
+		}
+		if (accounted+1)/partSize < maxUploadParts {
+			t.Errorf("part size %d: accounted object size %d is not the boundary; %d still fits in %d parts",
+				partSize, accounted, accounted+1, maxUploadParts)
+		}
+	}
+	resolved, err := validOptions().resolve()
+	if err != nil {
+		t.Fatalf("resolve defaults: %v", err)
+	}
+	if resolved.maxAccountedObjectSize != accountedObjectSize(resolved.multipartPartSize) {
+		t.Errorf("retained accounted object size = %d, want %d",
+			resolved.maxAccountedObjectSize, accountedObjectSize(resolved.multipartPartSize))
+	}
+}
+
+// TestMaxUploadPartsIsWithinTheSDKHardLimit guards the pin itself: the transfer
+// manager rejects MaxUploadParts outside (0, 10000], so an out-of-range pin
+// would fail every upload at runtime rather than at configuration time.
+func TestMaxUploadPartsIsWithinTheSDKHardLimit(t *testing.T) {
+	t.Parallel()
+	if maxUploadParts <= 0 || maxUploadParts > 10000 {
+		t.Fatalf("maxUploadParts = %d, want a value in (0, 10000] accepted by transfermanager", maxUploadParts)
 	}
 }
 

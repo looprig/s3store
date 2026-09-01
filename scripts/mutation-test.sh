@@ -6,7 +6,7 @@ shard=${2:-0}
 shards=${3:-1}
 mutation_index=0
 snapshot_dir="/private/tmp/s3store-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go s3store.go blob.go key.go internal/guard/guard.go"
+files="go.mod options.go s3store.go blob.go key.go transfer.go redact.go internal/guard/guard.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -82,7 +82,11 @@ run_mutation options "endpoint userinfo" options.go 'if parsed.User != nil {' 'i
 run_mutation options "endpoint query" options.go 'if parsed.RawQuery != "" || parsed.ForceQuery {' 'if false && (parsed.RawQuery != "" || parsed.ForceQuery) {' TestOptionsResolve 'endpoint_query'
 run_mutation options "endpoint fragment" options.go 'if parsed.Fragment != "" || parsed.RawFragment != "" {' 'if false && (parsed.Fragment != "" || parsed.RawFragment != "") {' TestOptionsResolve 'endpoint_fragment'
 run_mutation options "endpoint root path" options.go 'if parsed.Path != "" && parsed.Path != "/" {' 'if false && parsed.Path != "" && parsed.Path != "/" {' TestOptionsResolve 'endpoint_path'
-run_mutation options "HTTPS required" options.go 'if !allowInsecureLocal {' 'if false && !allowInsecureLocal {' TestOptionsResolve 'remote_plaintext'
+# The opt-in must be killed by a LOOPBACK fixture. On a non-loopback fixture the
+# next guard still rejects, so the test would pass for the wrong reason and the
+# opt-in could be deleted unnoticed.
+run_mutation options "HTTPS opt-in required" options.go 'if !allowInsecureLocal {' 'if false && !allowInsecureLocal {' TestOptionsResolve 'loopback_plaintext_without_opt-in'
+run_mutation options "HTTPS opt-in not implied by loopback" options.go 'if !allowInsecureLocal {' 'if !allowInsecureLocal && !isLoopbackHost(parsed.Hostname()) {' TestOptionsResolve 'loopback_plaintext_without_opt-in'
 run_mutation options "remote HTTP loopback" options.go 'if !isLoopbackHost(parsed.Hostname()) {' 'if false && !isLoopbackHost(parsed.Hostname()) {' TestOptionsResolveRejectsRemotePlaintextDespiteTestOptIn 'want loopback-only *OptionsError'
 run_mutation options "endpoint scheme" options.go 'return "", invalidOption("Endpoint", "must use HTTPS")' 'return parsed.Scheme + "://" + parsed.Host, nil' TestOptionsResolve 'unsupported_endpoint_scheme'
 run_mutation options "localhost classification" options.go 'if strings.EqualFold(host, "localhost") {' 'if false && strings.EqualFold(host, "localhost") {' TestOptionsResolveAllowsExplicitLocalPlaintext 'resolve:'
@@ -160,12 +164,72 @@ for operation in Put Get Delete List; do
 	run_mutation blob "$operation honest stub" blob.go "guard.NotImplemented(\"Blobs.$operation\")" "guard.RequireDeadline(ctx, \"Blobs.$operation\")" TestBlobOperationMethodsCallScaffoldGuards 'does not call guard.NotImplemented'
 done
 
-run_mutation deps "local replace directive" go.mod 'go 1.26.6' 'go 1.26.6
+run_mutation deps "replace directive" go.mod 'go 1.26.6' 'go 1.26.6
 
-replace github.com/looprig/storage => ../storage' TestDependencyBoundary 'replace directives, want none'
+replace example.test/absent-module v1.0.0 => example.test/absent-module v1.0.1' TestDependencyBoundary 'replace directives, want none'
 run_mutation deps "extra direct module" go.mod 'github.com/aws/smithy-go v1.28.1 // indirect' 'github.com/aws/smithy-go v1.28.1' TestDependencyBoundary 'direct modules ='
 run_mutation deps "logging import" s3store.go '"context"' '"context"
 	_ "log/slog"' TestDependencyBoundary 'imports logging package "log/slog"'
+
+run_mutation options "encryption posture must be explicit" options.go 'if o.Encryption == EncryptionUnspecified {' 'if false && o.Encryption == EncryptionUnspecified {' TestOptionsResolve 'unset_encryption'
+run_mutation memory "upload part pin within SDK limit" options.go 'maxUploadParts int64 = 10000' 'maxUploadParts int64 = 20000' TestMaxUploadPartsIsWithinTheSDKHardLimit 'want a value in (0, 10000]'
+run_mutation memory "accounted object size boundary" options.go 'return partSize*maxUploadParts - 1' 'return partSize * maxUploadParts' TestAccountedObjectSizeMarksThePartInflationBoundary 'already inflates'
+run_mutation memory "accounted object size retained" options.go 'maxAccountedObjectSize: accountedObjectSize(partSize),' 'maxAccountedObjectSize: accountedObjectSize(partSize) + 1,' TestAccountedObjectSizeMarksThePartInflationBoundary 'retained accounted object size ='
+
+run_mutation open "no network I/O during Open" s3store.go 'return newStore(client, transfers, resolved), nil' '_, _ = client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(resolved.bucket)})
+	return newStore(client, transfers, resolved), nil' TestOpenWiresBlobScaffoldWithoutNetworkIO 'Open performed network I/O'
+run_mutation open "upload part ceiling wiring" s3store.go 'options.MaxUploadParts = maxUploadParts' 'options.MaxUploadParts = maxUploadParts - 1' TestOpenWiresBlobScaffoldWithoutNetworkIO 'transfer MaxUploadParts ='
+run_mutation open "Store constructor invariant" s3store.go 'return newStore(client, transfers, resolved), nil' 'return &Store{client: client, transfers: transfers, options: resolved, transferSlots: make(chan struct{}, resolved.maxConcurrentTransfers)}, nil' TestStoreIsBuiltOnlyByItsConstructor 'builds a Store literal'
+
+run_mutation gate "transfer gate deadline" transfer.go 'if err := guard.RequireDeadline(ctx, operation); err != nil {' 'if err := error(nil); err != nil {' TestAcquireTransferRequiresDeadline 'want *DeadlineRequiredError'
+run_mutation gate "transfer gate nil-channel hang" transfer.go 'if s.transferSlots == nil {' 'if false && s.transferSlots == nil {' TestAcquireTransferFailsClosedOnUnconstructedStore 'blocked on a nil transferSlots channel'
+run_mutation gate "transfer gate cancellation" transfer.go 'case <-ctx.Done():' 'case <-make(chan struct{}):' TestAcquireTransferBoundsConcurrentTransfers 'ignored ctx.Done and hung'
+run_mutation gate "transfer gate release" transfer.go 'func (s *Store) releaseTransfer() {
+	<-s.transferSlots
+}' 'func (s *Store) releaseTransfer() {
+}' TestAcquireTransferBoundsConcurrentTransfers 'acquireTransfer after release'
+
+run_mutation interfaces "Leaser exclusion" key.go 'import (
+	"strings"
+
+	"github.com/looprig/storage"
+)' 'import (
+	"context"
+	"strings"
+
+	"github.com/looprig/storage"
+)
+
+func (s *Store) Acquire(context.Context, string) (storage.Lease, error) { return nil, nil }' TestStoreImplementsOnlyBlobs 'Store implements storage.Leaser'
+run_mutation interfaces "BlobReaderLifecycle exclusion" key.go 'import (
+	"strings"
+
+	"github.com/looprig/storage"
+)' 'import (
+	"strings"
+	"time"
+
+	"github.com/looprig/storage"
+)
+
+func (s *Store) BlobReaderCloseBound() time.Duration { return time.Second }' TestStoreImplementsOnlyBlobs 'Store implements storage.BlobReaderLifecycle'
+
+run_mutation security "invalid-name key redaction" redact.go 'return "s3store: invalid storage name: " + invalidName.Rule' 'return err.Error()' TestRedactedErrorTextDropsTenantScopedIdentifiers 'recorded text disclosed'
+run_mutation security "unclassified error fails closed" redact.go 'return redactedText
+}' 'return err.Error()
+}' TestRedactedErrorTextFailsClosedOnUnknownErrors 'unclassified error text ='
+
+run_mutation deps "standard stream write" s3store.go '	"github.com/looprig/s3store/internal/guard"
+)' '	"github.com/looprig/s3store/internal/guard"
+
+	"fmt"
+	"os"
+)
+
+func stderrLeak(v any) { fmt.Fprintln(os.Stderr, v) }' TestDependencyBoundary 'writes to os.Stderr'
+run_mutation deps "builtin println" s3store.go 'func defaultLoadConfig' 'func printlnLeak(v string) { println(v) }
+
+func defaultLoadConfig' TestDependencyBoundary 'calls the builtin println'
 
 restore_snapshot
 rm -rf "$snapshot_dir"

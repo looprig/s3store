@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,10 +26,26 @@ func TestOpenRequiresDeadline(t *testing.T) {
 	}
 }
 
+// TestStoreImplementsOnlyBlobs asserts the whole cross product the README and
+// CLAUDE.md claim, not one representative of it, so P2.2 cannot widen the
+// surface without failing here.
 func TestStoreImplementsOnlyBlobs(t *testing.T) {
 	var _ storage.Blobs = (*Store)(nil)
-	if _, implements := any((*Store)(nil)).(storage.Ledger); implements {
-		t.Fatal("Store implements storage.Ledger; s3store is Blobs-only")
+	store := any((*Store)(nil))
+	excluded := []struct {
+		name  string
+		check func(any) bool
+	}{
+		{"storage.Ledger", func(v any) bool { _, ok := v.(storage.Ledger); return ok }},
+		{"storage.Leaser", func(v any) bool { _, ok := v.(storage.Leaser); return ok }},
+		{"storage.KV", func(v any) bool { _, ok := v.(storage.KV); return ok }},
+		{"storage.OrderedIndex", func(v any) bool { _, ok := v.(storage.OrderedIndex); return ok }},
+		{"storage.BlobReaderLifecycle", func(v any) bool { _, ok := v.(storage.BlobReaderLifecycle); return ok }},
+	}
+	for _, interfaceCase := range excluded {
+		if interfaceCase.check(store) {
+			t.Errorf("Store implements %s; s3store is Blobs-only and claims no optional capability", interfaceCase.name)
+		}
 	}
 }
 
@@ -85,10 +103,39 @@ func TestOpenRedactsEverySDKLoaderFailure(t *testing.T) {
 	}
 }
 
+// forbiddenHTTPClient fails the test on any outbound request. It is installed
+// on the stub aws.Config so "performs no S3 request" is enforced by the
+// transport rather than asserted by the test's name.
+type forbiddenHTTPClient struct {
+	t        *testing.T
+	attempts atomic.Int64
+}
+
+func (c *forbiddenHTTPClient) Do(request *http.Request) (*http.Response, error) {
+	c.attempts.Add(1)
+	c.t.Errorf("Open performed network I/O: %s %s; P2.1 must contact no endpoint", request.Method, request.URL.Host)
+	return nil, errors.New("s3store test: network I/O is forbidden during Open")
+}
+
+// signableCredentials resolves complete credentials so a mutated Open reaches
+// the transport instead of failing earlier in the signer, which would let a
+// network-I/O mutation survive.
+type signableCredentials struct{}
+
+func (signableCredentials) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{AccessKeyID: "test-access", SecretAccessKey: "test-secret", Source: "s3store test"}, nil
+}
+
 func TestOpenWiresBlobScaffoldWithoutNetworkIO(t *testing.T) {
+	transport := &forbiddenHTTPClient{t: t}
 	original := loadConfig
 	loadConfig = func(_ context.Context, options resolvedOptions) (aws.Config, error) {
-		return aws.Config{Region: options.region, Credentials: options.credentials}, nil
+		return aws.Config{
+			Region:      options.region,
+			Credentials: aws.NewCredentialsCache(signableCredentials{}),
+			HTTPClient:  transport,
+			Retryer:     func() aws.Retryer { return aws.NopRetryer{} },
+		}, nil
 	}
 	t.Cleanup(func() { loadConfig = original })
 
@@ -129,16 +176,26 @@ func TestOpenWiresBlobScaffoldWithoutNetworkIO(t *testing.T) {
 	if got, want := transferOptions.FieldByName("GetObjectBufferSize").Int(), int64(options.Concurrency)*options.MultipartPartSize; got != want {
 		t.Errorf("transfer Get buffer = %d, want %d", got, want)
 	}
+	if got := transferOptions.FieldByName("MaxUploadParts").Int(); got != maxUploadParts {
+		t.Errorf("transfer MaxUploadParts = %d, want the pinned %d", got, maxUploadParts)
+	}
+	if store.options.maxAccountedObjectSize != accountedObjectSize(options.MultipartPartSize) {
+		t.Errorf("retained accounted object size = %d, want %d",
+			store.options.maxAccountedObjectSize, accountedObjectSize(options.MultipartPartSize))
+	}
 	if store.options.multipartThreshold != options.MultipartThreshold || store.options.bucket != options.Bucket || store.options.deploymentPrefix != options.DeploymentPrefix {
 		t.Errorf("retained scaffold policy = threshold %d bucket %q prefix %q", store.options.multipartThreshold, store.options.bucket, store.options.deploymentPrefix)
 	}
 	if cap(store.transferSlots) != options.MaxConcurrentTransfers {
 		t.Errorf("Store transfer slots = %d, want %d", cap(store.transferSlots), options.MaxConcurrentTransfers)
 	}
+	if attempts := transport.attempts.Load(); attempts != 0 {
+		t.Fatalf("Open issued %d HTTP request(s); P2.1 performs no S3 request", attempts)
+	}
 }
 
 func TestBlobOperationsRequireDeadlineBeforeStubResult(t *testing.T) {
-	store := &Store{}
+	store := newScaffoldStore()
 	operations := []struct {
 		name string
 		call func(context.Context) error
@@ -163,7 +220,7 @@ func TestBlobOperationsRequireDeadlineBeforeStubResult(t *testing.T) {
 }
 
 func TestBlobOperationsRejectNilContext(t *testing.T) {
-	store := &Store{}
+	store := newScaffoldStore()
 	//lint:ignore SA1012 This test exercises the public nil-context rejection guard.
 	err := store.Put(nil, "blobs/key", bytes.NewReader(nil))
 	var deadlineErr *DeadlineRequiredError
@@ -175,7 +232,7 @@ func TestBlobOperationsRejectNilContext(t *testing.T) {
 func TestBlobOperationsReturnHonestNotImplementedResults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store := &Store{}
+	store := newScaffoldStore()
 
 	if err := store.Put(ctx, "blobs/key", bytes.NewReader(nil)); !isNotImplemented(err, "Blobs.Put") {
 		t.Errorf("Put error = %T %v, want Blobs.Put *NotImplementedError", err, err)
@@ -196,7 +253,7 @@ func TestBlobOperationsReturnHonestNotImplementedResults(t *testing.T) {
 func TestBlobOperationsValidateKeysBeforeStubResult(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store := &Store{}
+	store := newScaffoldStore()
 	operations := []struct {
 		name string
 		call func(string) error
@@ -219,7 +276,7 @@ func TestBlobOperationsValidateKeysBeforeStubResult(t *testing.T) {
 func TestListPrefixValidation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store := &Store{}
+	store := newScaffoldStore()
 	for _, prefix := range []string{"", "blobs", "blobs/"} {
 		keys, err := store.List(ctx, prefix)
 		if keys != nil || !isNotImplemented(err, "Blobs.List") {
@@ -238,11 +295,18 @@ func isNotImplemented(err error, operation string) bool {
 	return errors.As(err, &notImplemented) && notImplemented.Operation == operation
 }
 
+// newScaffoldStore builds a client-free Store through the package constructor,
+// so every test shares the transferSlots invariant that Open establishes.
+func newScaffoldStore() *Store {
+	return newStore(nil, nil, resolvedOptions{maxConcurrentTransfers: 1})
+}
+
 func validOptions() Options {
 	return Options{
 		Endpoint:         "https://s3.example.test",
 		Region:           "us-east-1",
 		Bucket:           "looprig-test",
 		DeploymentPrefix: "deployments/test",
+		Encryption:       EncryptionAES256,
 	}
 }

@@ -42,3 +42,16 @@ func RequireDeadline(ctx context.Context, operation string) error {
 func NotImplemented(operation string) error {
 	return &NotImplementedError{Operation: operation}
 }
+
+// UnconstructedStoreError reports a Store value that was not produced by the
+// package constructor and therefore has no transfer gate. It exists so the
+// first acquisition fails closed with a typed error instead of blocking
+// forever on a nil channel.
+type UnconstructedStoreError struct {
+	Operation string
+}
+
+func (e *UnconstructedStoreError) Error() string {
+	return "s3store: operation " + strconv.Quote(e.Operation) +
+		" used a Store that was not built by the package constructor"
+}
