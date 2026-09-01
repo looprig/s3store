@@ -173,13 +173,20 @@ run_mutation deps "logging import" s3store.go '"context"' '"context"
 
 run_mutation options "encryption posture must be explicit" options.go 'if o.Encryption == EncryptionUnspecified {' 'if false && o.Encryption == EncryptionUnspecified {' TestOptionsResolve 'unset_encryption'
 run_mutation memory "upload part pin within SDK limit" options.go 'maxUploadParts int64 = 10000' 'maxUploadParts int64 = 20000' TestMaxUploadPartsIsWithinTheSDKHardLimit 'want a value in (0, 10000]'
+run_mutation memory "upload part pin tracks SDK default" options.go 'maxUploadParts int64 = 10000' 'maxUploadParts int64 = 5000' TestMaxUploadPartsPinMatchesTheSDKDefault 'the pin is no longer a no-op'
 run_mutation memory "accounted object size boundary" options.go 'return partSize*maxUploadParts - 1' 'return partSize * maxUploadParts' TestAccountedObjectSizeMarksThePartInflationBoundary 'already inflates'
 run_mutation memory "accounted object size retained" options.go 'maxAccountedObjectSize: accountedObjectSize(partSize),' 'maxAccountedObjectSize: accountedObjectSize(partSize) + 1,' TestAccountedObjectSizeMarksThePartInflationBoundary 'retained accounted object size ='
 
 run_mutation open "no network I/O during Open" s3store.go 'return newStore(client, transfers, resolved), nil' '_, _ = client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(resolved.bucket)})
 	return newStore(client, transfers, resolved), nil' TestOpenWiresBlobScaffoldWithoutNetworkIO 'Open performed network I/O'
 run_mutation open "upload part ceiling wiring" s3store.go 'options.MaxUploadParts = maxUploadParts' 'options.MaxUploadParts = maxUploadParts - 1' TestOpenWiresBlobScaffoldWithoutNetworkIO 'transfer MaxUploadParts ='
-run_mutation open "Store constructor invariant" s3store.go 'return newStore(client, transfers, resolved), nil' 'return &Store{client: client, transfers: transfers, options: resolved, transferSlots: make(chan struct{}, resolved.maxConcurrentTransfers)}, nil' TestStoreIsBuiltOnlyByItsConstructor 'builds a Store literal'
+run_mutation open "Store constructor invariant (literal)" s3store.go 'return newStore(client, transfers, resolved), nil' 'return &Store{client: client, transfers: transfers, options: resolved, transferSlots: make(chan struct{}, resolved.maxConcurrentTransfers)}, nil' TestStoreIsBuiltOnlyByItsConstructor 'via a composite literal'
+run_mutation open "Store constructor invariant (new)" s3store.go 'func defaultLoadConfig' 'func unconstructedNew() *Store { return new(Store) }
+
+func defaultLoadConfig' TestStoreIsBuiltOnlyByItsConstructor 'via new(Store)'
+run_mutation open "Store constructor invariant (var)" s3store.go 'func defaultLoadConfig' 'func unconstructedVar() *Store { var s Store; return &s }
+
+func defaultLoadConfig' TestStoreIsBuiltOnlyByItsConstructor 'via a var declaration'
 
 run_mutation gate "transfer gate deadline" transfer.go 'if err := guard.RequireDeadline(ctx, operation); err != nil {' 'if err := error(nil); err != nil {' TestAcquireTransferRequiresDeadline 'want *DeadlineRequiredError'
 run_mutation gate "transfer gate nil-channel hang" transfer.go 'if s.transferSlots == nil {' 'if false && s.transferSlots == nil {' TestAcquireTransferFailsClosedOnUnconstructedStore 'blocked on a nil transferSlots channel'
@@ -189,6 +196,24 @@ run_mutation gate "transfer gate release" transfer.go 'func (s *Store) releaseTr
 }' 'func (s *Store) releaseTransfer() {
 }' TestAcquireTransferBoundsConcurrentTransfers 'acquireTransfer after release'
 
+# Ledger IS reachable by a compiling mutation: its Delete signature is
+# byte-identical to Blobs.Delete, so only Append/Read/Tip need adding. KV and
+# OrderedIndex are not reachable -- both redeclare Get -- so three of the five
+# exclusions are mutation-proved and two are compile-time impossibilities.
+run_mutation interfaces "Ledger exclusion" key.go 'import (
+	"strings"
+
+	"github.com/looprig/storage"
+)' 'import (
+	"context"
+	"strings"
+
+	"github.com/looprig/storage"
+)
+
+func (s *Store) Append(context.Context, string, uint64, []byte) error { return nil }
+func (s *Store) Read(context.Context, string, uint64) (storage.Cursor, error) { return nil, nil }
+func (s *Store) Tip(context.Context, string) (uint64, error) { return 0, nil }' TestStoreImplementsOnlyBlobs 'Store implements storage.Ledger'
 run_mutation interfaces "Leaser exclusion" key.go 'import (
 	"strings"
 
@@ -215,6 +240,8 @@ run_mutation interfaces "BlobReaderLifecycle exclusion" key.go 'import (
 func (s *Store) BlobReaderCloseBound() time.Duration { return time.Second }' TestStoreImplementsOnlyBlobs 'Store implements storage.BlobReaderLifecycle'
 
 run_mutation security "invalid-name key redaction" redact.go 'return "s3store: invalid storage name: " + invalidName.Rule' 'return err.Error()' TestRedactedErrorTextDropsTenantScopedIdentifiers 'recorded text disclosed'
+run_mutation security "classification survives wrapping" redact.go 'var invalidName *storage.InvalidNameError
+	if errors.As(err, &invalidName) {' 'if invalidName, ok := err.(*storage.InvalidNameError); ok {' TestRedactedErrorTextDropsTenantScopedIdentifiers 'want the unwrapped classification'
 run_mutation security "unclassified error fails closed" redact.go 'return redactedText
 }' 'return err.Error()
 }' TestRedactedErrorTextFailsClosedOnUnknownErrors 'unclassified error text ='

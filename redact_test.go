@@ -38,8 +38,16 @@ func TestRedactedErrorTextDropsTenantScopedIdentifiers(t *testing.T) {
 		t.Errorf("recorded text = %q, want the grammar rule %q retained", recorded, invalidName.Rule)
 	}
 
-	// Wrapping must not defeat the classification.
+	// Wrapping must not defeat the classification. Asserting only the absence
+	// of the key is not enough: falling through to redactedText also contains
+	// no key, so the negative alone is satisfied by the very failure it means
+	// to exclude. Assert the positive -- a wrapped error classifies exactly as
+	// the unwrapped one -- or P2.2's wrapped errors silently degrade to
+	// "withheld" and lose their failure class.
 	wrapped := fmt.Errorf("Blobs.Put: %w", returned)
+	if got, want := RedactedErrorText(wrapped), RedactedErrorText(returned); got != want {
+		t.Errorf("wrapped error text = %q, want the unwrapped classification %q", got, want)
+	}
 	if strings.Contains(RedactedErrorText(wrapped), "super-secret") {
 		t.Errorf("wrapped error disclosed the key: %q", RedactedErrorText(wrapped))
 	}

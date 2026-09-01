@@ -176,6 +176,9 @@ func TestOpenWiresBlobScaffoldWithoutNetworkIO(t *testing.T) {
 	if got, want := transferOptions.FieldByName("GetObjectBufferSize").Int(), int64(options.Concurrency)*options.MultipartPartSize; got != want {
 		t.Errorf("transfer Get buffer = %d, want %d", got, want)
 	}
+	// This detects a wrong pinned value but cannot detect the assignment's
+	// removal: the SDK default is the same 10000. That gap is deliberate and
+	// is covered by TestMaxUploadPartsPinMatchesTheSDKDefault instead.
 	if got := transferOptions.FieldByName("MaxUploadParts").Int(); got != maxUploadParts {
 		t.Errorf("transfer MaxUploadParts = %d, want the pinned %d", got, maxUploadParts)
 	}

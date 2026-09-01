@@ -14,13 +14,23 @@ import (
 )
 
 // TestStoreIsBuiltOnlyByItsConstructor enforces the invariant that makes the
-// transfer gate usable: a Store composite literal anywhere but newStore
-// produces a nil transferSlots channel, and a send on a nil channel is a
-// silent permanent hang rather than an error.
+// transfer gate usable: a Store built anywhere but newStore has a nil
+// transferSlots channel, and a send on a nil channel is a silent permanent
+// hang rather than an error.
+//
+// The guard covers every way to obtain a zero-value Store, not just composite
+// literals: new(Store) and a var declaration of Store produce exactly the same
+// nil channel and would otherwise walk straight past a literal-only check.
+// TestAcquireTransferFailsClosedOnUnconstructedStore is the one sanctioned
+// exception, because building an unconstructed Store is its whole subject.
 func TestStoreIsBuiltOnlyByItsConstructor(t *testing.T) {
 	t.Parallel()
+	sanctioned := map[string]bool{
+		"newStore": true,
+		"TestAcquireTransferFailsClosedOnUnconstructedStore": true,
+	}
 	fileSet := token.NewFileSet()
-	literals := 0
+	constructions := 0
 	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -41,19 +51,15 @@ func TestStoreIsBuiltOnlyByItsConstructor(t *testing.T) {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				literal, ok := node.(*ast.CompositeLit)
-				if !ok {
+				form := storeConstructionForm(node)
+				if form == "" {
 					return true
 				}
-				identifier, ok := literal.Type.(*ast.Ident)
-				if !ok || identifier.Name != "Store" {
-					return true
-				}
-				literals++
-				if function.Name.Name != "newStore" {
-					position := fileSet.Position(literal.Pos())
-					t.Errorf("%s:%d %s builds a Store literal; only newStore may, or transferSlots is nil and the gate hangs",
-						path, position.Line, function.Name.Name)
+				constructions++
+				if !sanctioned[function.Name.Name] {
+					position := fileSet.Position(node.Pos())
+					t.Errorf("%s:%d %s builds an unconstructed Store via %s; only newStore may, or transferSlots is nil and the gate hangs",
+						path, position.Line, function.Name.Name, form)
 				}
 				return true
 			})
@@ -63,9 +69,35 @@ func TestStoreIsBuiltOnlyByItsConstructor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walk package files: %v", err)
 	}
-	if literals != 1 {
-		t.Fatalf("Store composite literals = %d, want exactly the one in newStore", literals)
+	if constructions != 2 {
+		t.Fatalf("direct Store constructions = %d, want exactly newStore's literal and the unconstructed-Store fixture", constructions)
 	}
+}
+
+// storeConstructionForm names the syntax by which node obtains a Store value
+// directly, or returns "" if it does not. A *Store variable is not a
+// construction: it is nil until something assigns to it.
+func storeConstructionForm(node ast.Node) string {
+	isStore := func(expr ast.Expr) bool {
+		identifier, ok := expr.(*ast.Ident)
+		return ok && identifier.Name == "Store"
+	}
+	switch typed := node.(type) {
+	case *ast.CompositeLit:
+		if isStore(typed.Type) {
+			return "a composite literal"
+		}
+	case *ast.CallExpr:
+		callee, ok := typed.Fun.(*ast.Ident)
+		if ok && callee.Name == "new" && len(typed.Args) == 1 && isStore(typed.Args[0]) {
+			return "new(Store)"
+		}
+	case *ast.ValueSpec:
+		if typed.Type != nil && isStore(typed.Type) {
+			return "a var declaration"
+		}
+	}
+	return ""
 }
 
 func TestAcquireTransferRequiresDeadline(t *testing.T) {

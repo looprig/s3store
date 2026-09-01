@@ -57,9 +57,12 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		options.PartSizeBytes = resolved.multipartPartSize
 		options.Concurrency = resolved.concurrency
 		options.GetObjectBufferSize = int64(resolved.concurrency) * resolved.multipartPartSize
-		// Pin the part ceiling instead of inheriting the SDK default, so
-		// resolved.maxAccountedObjectSize is derived from a value this module
-		// chose. Above that size the SDK inflates PartSizeBytes regardless.
+		// Pin the part ceiling instead of inheriting it. This is a no-op
+		// today: the SDK's default is the same 10000, which is also its hard
+		// maximum, so removing this line changes nothing observable and no
+		// mutation of it can fail. It exists against a future change to that
+		// default, which TestMaxUploadPartsPinMatchesTheSDKDefault detects and
+		// which would make maxAccountedObjectSize wrong.
 		options.MaxUploadParts = maxUploadParts
 	})
 	return newStore(client, transfers, resolved), nil

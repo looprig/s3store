@@ -3,11 +3,13 @@ package s3store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 )
 
 type testCredentialsProvider struct{}
@@ -199,6 +201,26 @@ func TestMaxUploadPartsIsWithinTheSDKHardLimit(t *testing.T) {
 	t.Parallel()
 	if maxUploadParts <= 0 || maxUploadParts > 10000 {
 		t.Fatalf("maxUploadParts = %d, want a value in (0, 10000] accepted by transfermanager", maxUploadParts)
+	}
+}
+
+// TestMaxUploadPartsPinMatchesTheSDKDefault is what makes the pin honest.
+//
+// The wiring assertion in TestOpenWiresBlobScaffoldWithoutNetworkIO cannot
+// detect the pin's removal, because the SDK's own default is the same 10000:
+// deleting the assignment changes nothing observable today. The pin is
+// therefore a no-op that exists solely against future SDK-default drift, and
+// this test is the thing that notices that drift. If it fails, AWS changed the
+// default, accountedObjectSize must be re-derived from the new value, and the
+// wiring assertion becomes load-bearing for the first time.
+func TestMaxUploadPartsPinMatchesTheSDKDefault(t *testing.T) {
+	t.Parallel()
+	defaults := transfermanager.New(nil)
+	sdkDefault := reflect.ValueOf(defaults).Elem().FieldByName("options").FieldByName("MaxUploadParts").Int()
+	if sdkDefault != maxUploadParts {
+		t.Fatalf("transfermanager default MaxUploadParts = %d, module pin = %d; the pin is no longer a no-op: "+
+			"re-derive accountedObjectSize and the documented transfer-memory bound from the pinned value",
+			sdkDefault, maxUploadParts)
 	}
 }
 
