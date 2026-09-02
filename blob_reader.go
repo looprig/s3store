@@ -13,12 +13,14 @@ import (
 // any provider-controlled Read to return after Close begins.
 //
 // The mechanism is not a timer, and nothing here sleeps: Close cancels the
-// context the payload GetObject was issued with and then closes the response
-// body. Cancelling the request context makes the HTTP transport tear the
-// connection down, which is what forces a Read blocked on a socket to return.
-// That is the capability fsstore cannot offer -- a blocked filesystem read has
-// no equivalent interruption -- and it is the reason this module may claim the
-// capability while fsstore may not.
+// context the payload GetObject was issued with AND closes the response body.
+// Each of those was measured to release a Read blocked on a socket on its own,
+// so neither is load-bearing against the other; both are done because the
+// cancellation reaches the transport through any SDK body wrapper while the
+// body Close is the documented way to release a response. Either way a blocked
+// socket read is interrupted, which is the capability fsstore cannot offer --
+// a blocked filesystem read has no equivalent interruption -- and it is the
+// reason this module may claim the capability while fsstore may not.
 //
 // The number is a conservative ceiling on that teardown, not a measurement of
 // it. It is generous on purpose: sessionstore consults it once, at Open, for
@@ -34,10 +36,17 @@ func (s *Store) BlobReaderCloseBound() time.Duration {
 }
 
 // BlobReaderClosedError is the terminal error every Read returns once Close has
-// begun. It is deliberately not io.EOF: a consumer that treats EOF as "the
-// stream was verified through its end" would otherwise record a torn-down
-// stream as verified content. It matches fs.ErrClosed under errors.Is so the
-// classification is the same one memstore uses.
+// begun. It is deliberately not io.EOF: sessionstore compares bare io.EOF by
+// identity to mean "verified through terminal EOF", so a closed reader that
+// still answered io.EOF could be taken for a stream that ended cleanly.
+//
+// Scope of that claim: sessionstore only reaches the identity comparison for a
+// caller DRAINING the stream with no termination already in flight -- a Read
+// racing a Close has its error joined rather than identity-compared, and
+// exactVerifier is a second guard behind it. So this is defence in depth on a
+// reachable path, not the sole thing standing between a torn-down stream and a
+// verified record. It matches fs.ErrClosed under errors.Is, the classification
+// memstore uses.
 type BlobReaderClosedError struct{}
 
 func (e *BlobReaderClosedError) Error() string {
@@ -59,8 +68,9 @@ var errBlobReaderClosed error = &BlobReaderClosedError{}
 // exists to forbid; the only shared state is an atomic flag and two sync.Onces.
 type blobReader struct {
 	verifier *verifyingBlobReader
-	// abort cancels the context the payload request was issued with. It is the
-	// unblocking mechanism; closing the body alone is not relied on.
+	// abort cancels the context the payload request was issued with. It is one
+	// of the two unblocking mechanisms, not the only one: closing the body
+	// releases a stalled Read too, measured in both directions. Both are used.
 	abort   context.CancelFunc
 	release func()
 

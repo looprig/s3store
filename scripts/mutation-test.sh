@@ -397,6 +397,63 @@ run_mutation lifecycle "closed check precedes the verifier" blob_reader.go '	if 
 run_mutation lifecycle "closed check follows the verifier" blob_reader.go '	n, err := r.verifier.Read(buffer)
 	if r.closed.Load() {' '	n, err := r.verifier.Read(buffer)
 	if false && r.closed.Load() {' TestReadInFlightWhenCloseBeginsIsTerminal 'bytes after Close, want 0'
+# "Close shares no lock with Read" is the rule sessionstore's
+# completeTermination depends on most directly, and it is the one that cannot be
+# probed with a single-line edit: memstore's design needs a lock in BOTH
+# methods, so the hunk spans them. It is worth the verbosity, because inline the
+# mutant deadlocks and surfaces only as the go test timeout -- the harness would
+# report a hang, and a kill by hang is not an assertion kill. The test now
+# receives Close under a bound, so this dies on an assertion.
+run_mutation lifecycle "Read and Close share no lock" blob_reader.go 'func (r *blobReader) Read(buffer []byte) (int, error) {
+	if r.closed.Load() {
+		return 0, errBlobReaderClosed
+	}
+	n, err := r.verifier.Read(buffer)
+	if r.closed.Load() {
+		// Close began while this Read was in flight. Whatever the aborted body
+		// produced -- bytes, nil, io.EOF, or a transport error -- is not a
+		// terminal result for this stream, and the bytes are discarded.
+		return 0, errBlobReaderClosed
+	}
+	if err != nil {
+		r.releaseOnce.Do(r.release)
+	}
+	return n, err
+}
+
+// Close is idempotent with a stable classification: the first call computes the
+// result under a sync.Once and every later call returns that same value rather
+// than closing the body a second time.
+func (r *blobReader) Close() error {
+	r.closeOnce.Do(func() {' 'var mutantReadCloseSerialization sync.Mutex
+
+func (r *blobReader) Read(buffer []byte) (int, error) {
+	mutantReadCloseSerialization.Lock()
+	defer mutantReadCloseSerialization.Unlock()
+	if r.closed.Load() {
+		return 0, errBlobReaderClosed
+	}
+	n, err := r.verifier.Read(buffer)
+	if r.closed.Load() {
+		// Close began while this Read was in flight. Whatever the aborted body
+		// produced -- bytes, nil, io.EOF, or a transport error -- is not a
+		// terminal result for this stream, and the bytes are discarded.
+		return 0, errBlobReaderClosed
+	}
+	if err != nil {
+		r.releaseOnce.Do(r.release)
+	}
+	return n, err
+}
+
+// Close is idempotent with a stable classification: the first call computes the
+// result under a sync.Once and every later call returns that same value rather
+// than closing the body a second time.
+func (r *blobReader) Close() error {
+	mutantReadCloseSerialization.Lock()
+	defer mutantReadCloseSerialization.Unlock()
+	r.closeOnce.Do(func() {' TestReadInFlightWhenCloseBeginsIsTerminal 'Close must share no lock with Read'
+
 # There is deliberately no mutation for the ORDER of the closed store against
 # the teardown inside Close. It was probed (deferring the store to the end of
 # Close) and SURVIVED, and it should have: the contract constrains Reads after

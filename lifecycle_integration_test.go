@@ -87,11 +87,20 @@ func TestCloseUnblocksAStalledPayloadRead(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 	}
 
+	// Close is received under a bound rather than called inline, so a Close that
+	// waits for the stalled Read fails here as an assertion instead of hanging
+	// until the go test timeout.
 	closeStarted := time.Now()
-	closeErr := reader.Close()
-	closeElapsed := time.Since(closeStarted)
-	if closeElapsed > blobReaderCloseBound {
-		t.Errorf("Close took %v with a Read blocked, want at most the advertised %v", closeElapsed, blobReaderCloseBound)
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- reader.Close() }()
+	var closeErr error
+	select {
+	case closeErr = <-closeResult:
+		if elapsed := time.Since(closeStarted); elapsed > blobReaderCloseBound {
+			t.Errorf("Close took %v with a Read blocked, want at most the advertised %v", elapsed, blobReaderCloseBound)
+		}
+	case <-time.After(blobReaderCloseBound):
+		t.Fatalf("Close did not return within the advertised %v while a Read was blocked; Close must not wait for a Read", blobReaderCloseBound)
 	}
 	if closeErr != nil && !errors.Is(closeErr, context.Canceled) {
 		t.Logf("Close on a stalled body returned %v", closeErr)

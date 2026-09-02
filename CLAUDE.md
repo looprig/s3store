@@ -84,10 +84,18 @@ error only.
   request context and closes the body; `Close` shares no lock with `Read`, so it
   never waits for one; `Close` is latched and classification-stable; and no
   `Read` after `Close` returns bytes or `io.EOF` -- it returns
-  `*BlobReaderClosedError`, matching `fs.ErrClosed`. The EOF rule is not
-  cosmetic: sessionstore compares bare `io.EOF` by identity to mean verified
-  content. Do NOT adopt memstore's single-mutex Read/Close serialization; it
-  makes `Close` wait for a blocked network read.
+  `*BlobReaderClosedError`, matching `fs.ErrClosed`. The EOF rule is defence in
+  depth on a reachable path: sessionstore identity-compares bare `io.EOF` when a
+  caller drains a stream with no termination in flight, while a `Read` racing a
+  `Close` has its error joined instead. Do NOT adopt memstore's single-mutex
+  Read/Close serialization; it makes `Close` wait for a blocked network read.
+  That rule is the one `completeTermination` depends on most directly, and its
+  only detector is `TestReadInFlightWhenCloseBeginsIsTerminal`, which receives
+  `Close` on a goroutine under a bound — inline, the serializing mutant
+  deadlocks and surfaces as a `go test` timeout, and a kill by hang is not an
+  assertion kill.
+- The stream is bounded by the `Get` call's deadline, because the payload
+  request is a child of that context. There is no separate stream deadline.
 - Over a real HTTP body most of those parts mask each other -- abort and body
   Close each unblock a stalled read alone, net/http Close is idempotent, and
   the two closed checks are interchangeable after Close returns. They are held

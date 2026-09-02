@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -115,10 +116,22 @@ func TestCloseClassificationIsLatchedAcrossAnUnstableBody(t *testing.T) {
 // TestReadInFlightWhenCloseBeginsIsTerminal supplies the body the conformance
 // suite cannot: one that returns real bytes AFTER Close has returned. Without
 // the closed check that follows the verifier, those bytes reach the caller.
+//
+// It is also the only detector for "Close shares no lock with Read", the rule
+// sessionstore's completeTermination depends on most directly: it calls the
+// provider Close while a provider Read may be in flight and then waits for that
+// read to land.
 func TestReadInFlightWhenCloseBeginsIsTerminal(t *testing.T) {
 	t.Parallel()
 	released := make(chan struct{})
 	entered := make(chan struct{})
+	var releaseOnce sync.Once
+	// The release is deferred as well as called below so that a Close which
+	// never returns still leaves the blocked Read unblocked when this test
+	// fails. Without that, a serializing mutant would wedge every later test
+	// in the package instead of failing this one.
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+	defer release()
 	var once atomic.Bool
 	body := &fakeBody{readFn: func(buffer []byte) (int, error) {
 		if once.CompareAndSwap(false, true) {
@@ -141,10 +154,23 @@ func TestReadInFlightWhenCloseBeginsIsTerminal(t *testing.T) {
 		result <- outcome{n: n, err: err}
 	}()
 	<-entered
-	if err := reader.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+
+	// Close runs on its own goroutine and is received under a bound. Calling it
+	// inline would turn "Close waited for a Read" -- the memstore design this
+	// module forbids -- into a deadlock that surfaces only as the go test
+	// timeout, and a kill by hang is not an assertion kill. This is the only
+	// detector for that rule.
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- reader.Close() }()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(blobReaderCloseBound):
+		t.Fatalf("Close did not return within %v while a Read was in flight; Close must share no lock with Read", blobReaderCloseBound)
 	}
-	close(released)
+	release()
 	select {
 	case got := <-result:
 		if got.n != 0 {
@@ -191,9 +217,11 @@ func TestReadAfterCloseDoesNotConsultAnUnresponsiveBody(t *testing.T) {
 }
 
 // TestReadAfterCloseNeverReportsEOFOnADrainedStream is the row for a stream
-// that DID reach a clean, verified end. sessionstore compares bare io.EOF by
-// identity to mean "verified through terminal EOF", so a closed reader that
-// still answers io.EOF would have a torn-down stream recorded as verified.
+// that DID reach a clean, verified end -- which is also the shape sessionstore
+// actually identity-compares io.EOF on: a caller draining the stream with no
+// termination in flight. A Read racing a Close has its error joined instead, so
+// this rule is defence in depth on that draining path rather than a guard on
+// the racing one.
 func TestReadAfterCloseNeverReportsEOFOnADrainedStream(t *testing.T) {
 	t.Parallel()
 	const content = "drained"

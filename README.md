@@ -107,16 +107,28 @@ is a claim about a mechanism, not a promise about a number:
 - **`Close` is latched.** The first call computes the result; every later call
   returns that same value and does not close the body again.
 - **No `Read` after `Close` returns bytes or `io.EOF`.** It returns
-  `*BlobReaderClosedError`, which matches `fs.ErrClosed` and never `io.EOF`. The
-  distinction is load-bearing for consumers: sessionstore compares bare `io.EOF`
-  by identity to mean "verified through terminal EOF", so a torn-down stream
-  answering `io.EOF` would be recorded as verified content.
+  `*BlobReaderClosedError`, which matches `fs.ErrClosed` and never `io.EOF`.
+  sessionstore compares bare `io.EOF` by identity to mean "verified through
+  terminal EOF" — on the path where a caller drains the stream with no
+  termination in flight. A `Read` racing a `Close` has its error joined rather
+  than identity-compared, and a second verifier sits behind that, so this rule
+  is defence in depth on a reachable path rather than the only thing separating
+  a torn-down stream from a verified record.
 
 `BlobReaderCloseBound` is a conservative constant, not a measurement. What is
 measured is the mechanism: a fixture serves a short prefix of a payload and then
 stops writing, so a real `Read` blocks on a real socket, and the test requires
 `Close` to return and the blocked `Read` to land with a non-EOF error inside the
-advertised bound.
+advertised bound. That measurement is loopback against an in-process fixture, so
+the constant is a declared ceiling on teardown rather than a latency guarantee
+against a remote endpoint or a wedged middlebox.
+
+One caller-visible consequence of how the stream is scoped: the payload request
+is issued on a child of the context passed to `Get`, and every operation here
+requires a caller deadline, so **the returned stream is bounded by the `Get`
+call's deadline, not by a separate stream deadline**. A caller that obtains a
+reader under a short `Get` deadline and then streams past it will see the
+payload torn down. Pass `Get` a context whose deadline covers the read.
 
 ## Recording errors
 
