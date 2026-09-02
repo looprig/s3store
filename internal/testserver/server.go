@@ -54,6 +54,9 @@ type Server struct {
 	blocks          map[string][]*requestBlock
 	commitBlocks    map[string][]*commitBlock
 	commitFaults    map[string][]fault
+	createdUploads  []string
+	abortedUploads  []string
+	objectHeaders   map[string][]http.Header
 	pageLimit       int
 	ranges          []string
 	rangeIfMatches  []string
@@ -65,8 +68,9 @@ func New() *Server {
 	server := &Server{
 		objects: make(map[string]object), uploads: make(map[string]*upload),
 		counts: make(map[string]int), faults: make(map[string][]fault), blocks: make(map[string][]*requestBlock),
-		commitBlocks: make(map[string][]*commitBlock),
-		commitFaults: make(map[string][]fault),
+		commitBlocks:  make(map[string][]*commitBlock),
+		commitFaults:  make(map[string][]fault),
+		objectHeaders: make(map[string][]http.Header),
 	}
 	server.http = httptest.NewServer(http.HandlerFunc(server.serveHTTP))
 	return server
@@ -74,6 +78,68 @@ func New() *Server {
 
 func (s *Server) URL() string { return s.http.URL }
 func (s *Server) Close()      { s.http.Close() }
+
+// OpenForeignUpload creates a multipart upload that no Store owns and returns
+// its ID. It models an upload left behind by another process: only a sweep
+// would find it.
+func (s *Server) OpenForeignUpload(bucket, key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextID++
+	id := strconv.FormatUint(s.nextID, 10)
+	s.uploads[id] = &upload{bucket: bucket, key: key, parts: make(map[int][]byte)}
+	s.createdUploads = append(s.createdUploads, id)
+	return id
+}
+
+// Keys returns every stored object key in one bucket.
+func (s *Server) Keys(bucket string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.objects))
+	for id := range s.objects {
+		objectBucket, objectKey, _ := strings.Cut(id, "\x00")
+		if objectBucket == bucket {
+			keys = append(keys, objectKey)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// CreatedUploads returns every multipart upload ID the fixture issued, in
+// creation order.
+func (s *Server) CreatedUploads() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.createdUploads...)
+}
+
+// AbortedUploads returns every upload ID an AbortMultipartUpload named,
+// including IDs the fixture never issued.
+func (s *Server) AbortedUploads() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.abortedUploads...)
+}
+
+// ActiveUploads returns the number of multipart uploads that were created and
+// neither completed nor aborted.
+func (s *Server) ActiveUploads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.uploads)
+}
+
+// ObjectHeaders returns the request headers of every object-creating request
+// that reached the named operation, in arrival order. A request that carried no
+// server-side encryption header is present with that header absent, so an
+// assertion over these can distinguish "not set" from "not requested".
+func (s *Server) ObjectHeaders(operation string) []http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]http.Header(nil), s.objectHeaders[operation]...)
+}
 
 // Count returns how many requests reached an operation.
 func (s *Server) Count(operation string) int {
@@ -165,6 +231,9 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	operation := operationName(request.Method, key, query)
 	s.mu.Lock()
 	s.counts[operation]++
+	if isObjectCreating(operation) {
+		s.objectHeaders[operation] = append(s.objectHeaders[operation], request.Header.Clone())
+	}
 	var injected *fault
 	if queued := s.faults[operation]; len(queued) > 0 {
 		current := queued[0]
@@ -214,6 +283,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch {
 	case request.Method == http.MethodGet && key == "" && query.Get("list-type") == "2":
 		s.listObjects(writer, request, bucket)
+	case request.Method == http.MethodGet && key == "" && hasQueryKey(query, "uploads"):
+		s.listMultipartUploads(writer, bucket)
 	case request.Method == http.MethodPost && key != "" && hasQueryKey(query, "uploads"):
 		s.createMultipart(writer, bucket, key)
 	case request.Method == http.MethodPut && key != "" && query.Get("uploadId") != "":
@@ -239,6 +310,8 @@ func operationName(method, key string, query url.Values) string {
 	switch {
 	case method == http.MethodGet && key == "" && query.Get("list-type") == "2":
 		return "ListObjectsV2"
+	case method == http.MethodGet && key == "" && hasQueryKey(query, "uploads"):
+		return "ListMultipartUploads"
 	case method == http.MethodPost && hasQueryKey(query, "uploads"):
 		return "CreateMultipartUpload"
 	case method == http.MethodPut && query.Get("uploadId") != "":
@@ -461,11 +534,41 @@ func (s *Server) listObjects(writer http.ResponseWriter, request *http.Request, 
 	writeXML(writer, http.StatusOK, response)
 }
 
+// listMultipartUploads reports every in-progress upload in one bucket. It
+// exists so that "s3store never sweeps" is a falsifiable claim: a sweep would
+// have somewhere to look.
+func (s *Server) listMultipartUploads(writer http.ResponseWriter, bucket string) {
+	type entry struct {
+		Key    string `xml:"Key"`
+		Upload string `xml:"UploadId"`
+	}
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.uploads))
+	for id := range s.uploads {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	uploads := make([]entry, 0, len(ids))
+	for _, id := range ids {
+		if active := s.uploads[id]; active.bucket == bucket {
+			uploads = append(uploads, entry{Key: active.key, Upload: id})
+		}
+	}
+	s.mu.Unlock()
+	writeXML(writer, http.StatusOK, struct {
+		XMLName     xml.Name `xml:"ListMultipartUploadsResult"`
+		Bucket      string   `xml:"Bucket"`
+		IsTruncated bool     `xml:"IsTruncated"`
+		Uploads     []entry  `xml:"Upload"`
+	}{Bucket: bucket, Uploads: uploads})
+}
+
 func (s *Server) createMultipart(writer http.ResponseWriter, bucket, key string) {
 	s.mu.Lock()
 	s.nextID++
 	id := strconv.FormatUint(s.nextID, 10)
 	s.uploads[id] = &upload{bucket: bucket, key: key, parts: make(map[int][]byte)}
+	s.createdUploads = append(s.createdUploads, id)
 	s.mu.Unlock()
 	writeXML(writer, http.StatusOK, struct {
 		XMLName xml.Name `xml:"InitiateMultipartUploadResult"`
@@ -540,9 +643,23 @@ func (s *Server) completeMultipart(writer http.ResponseWriter, request *http.Req
 
 func (s *Server) abortMultipart(writer http.ResponseWriter, uploadID string) {
 	s.mu.Lock()
+	s.abortedUploads = append(s.abortedUploads, uploadID)
 	delete(s.uploads, uploadID)
 	s.mu.Unlock()
 	writer.WriteHeader(http.StatusNoContent)
+}
+
+// isObjectCreating reports whether an operation is one that commits object
+// bytes and therefore must carry the configured server-side encryption header.
+// CompleteMultipartUpload is excluded: S3 takes the encryption posture from the
+// CreateMultipartUpload that opened the upload, not from its completion.
+func isObjectCreating(operation string) bool {
+	switch operation {
+	case "PutPayload", "PutManifest", "CreateMultipartUpload":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasQueryKey(values map[string][]string, key string) bool {

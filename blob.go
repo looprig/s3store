@@ -241,7 +241,7 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 		return nil, err
 	}
 	defer s.releaseTransfer()
-	backendPrefix := s.options.deploymentPrefix + "/" + manifestNamespace
+	backendPrefix := namespaceRoot(s.options.deploymentPrefix, manifestNamespace)
 	seen := make(map[string]struct{})
 	var continuation *string
 	for {
@@ -427,6 +427,14 @@ func manifestsMatch(left, right blobManifest) bool {
 	return left.LogicalKey == right.LogicalKey && left.Size == right.Size && equalDigest(left.Digest[:], right.Digest[:])
 }
 
+// payloadRoot is the single derivation of one logical key's payload directory.
+// Staging and matching share it so a payload cannot be written outside the
+// deployment root while still matching the check that is supposed to catch it.
+func payloadRoot(deploymentPrefix, logicalKey string) string {
+	digest := sha256.Sum256([]byte(logicalKey))
+	return namespaceRoot(deploymentPrefix, payloadNamespace) + hex.EncodeToString(digest[:]) + "/"
+}
+
 func newPayloadObjectKey(deploymentPrefix, logicalKey string) (string, error) {
 	if err := storage.ValidateName(deploymentPrefix); err != nil {
 		return "", err
@@ -438,8 +446,7 @@ func newPayloadObjectKey(deploymentPrefix, logicalKey string) (string, error) {
 	if _, err := rand.Read(attempt[:]); err != nil {
 		return "", &BackendError{Operation: "payload identity"}
 	}
-	digest := sha256.Sum256([]byte(logicalKey))
-	key := deploymentPrefix + "/" + payloadNamespace + hex.EncodeToString(digest[:]) + "/" + hex.EncodeToString(attempt[:])
+	key := payloadRoot(deploymentPrefix, logicalKey) + hex.EncodeToString(attempt[:])
 	if len(key) > maxS3ObjectKeyBytes {
 		return "", invalidOption("DeploymentPrefix", "exceeds the S3 object-key limit")
 	}
@@ -447,8 +454,7 @@ func newPayloadObjectKey(deploymentPrefix, logicalKey string) (string, error) {
 }
 
 func payloadObjectKeyMatches(deploymentPrefix, logicalKey, payloadKey string) bool {
-	digest := sha256.Sum256([]byte(logicalKey))
-	wantPrefix := deploymentPrefix + "/" + payloadNamespace + hex.EncodeToString(digest[:]) + "/"
+	wantPrefix := payloadRoot(deploymentPrefix, logicalKey)
 	if !strings.HasPrefix(payloadKey, wantPrefix) || len(payloadKey) != len(wantPrefix)+32 {
 		return false
 	}

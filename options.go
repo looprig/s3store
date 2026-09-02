@@ -69,6 +69,15 @@ type Options struct {
 	Encryption      EncryptionMode
 	KMSKeyID        string
 
+	// RequireConfirmedEncryption states that the deployment policy requires
+	// server-side encryption. When it is set, Open accepts only a posture this
+	// module itself puts on the wire, and refuses EncryptionBucketDefault with
+	// a typed *EncryptionPolicyError: that posture is enforced by a bucket
+	// policy Open cannot confirm, because Open issues no S3 request. Leaving
+	// it false is the pre-existing behaviour and does not weaken any other
+	// check; EncryptionUnspecified is still rejected either way.
+	RequireConfirmedEncryption bool
+
 	MultipartThreshold int64
 	MultipartPartSize  int64
 	Concurrency        int
@@ -152,6 +161,9 @@ func (o Options) resolve() (resolvedOptions, error) {
 		return resolvedOptions{}, invalidOption("Encryption", "has an unknown mode")
 	}
 	if err := validateKMSKey(o.Encryption, o.KMSKeyID); err != nil {
+		return resolvedOptions{}, err
+	}
+	if err := requireConfirmedEncryption(o.RequireConfirmedEncryption, o.Encryption); err != nil {
 		return resolvedOptions{}, err
 	}
 

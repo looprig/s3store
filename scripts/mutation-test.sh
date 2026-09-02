@@ -7,7 +7,7 @@ shards=${3:-1}
 mutation_index=0
 killed=0
 snapshot_dir="/private/tmp/s3store-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go s3store.go blob.go blob_io.go manifest.go key.go transfer.go redact.go blob_test.go internal/guard/guard.go"
+files="go.mod options.go s3store.go blob.go blob_io.go manifest.go key.go transfer.go redact.go encryption.go blob_test.go internal/guard/guard.go internal/testserver/server.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -299,6 +299,77 @@ run_mutation protocol "cleanup caller deadline" blob.go 'if payloadOwned && clea
 			defer cancel()
 			s.deletePayloadBestEffort(cleanupCtx, payloadKey)
 		}' TestPutVerificationCancellationDoesNotStartDetachedCleanup 'detached cleanup outlived the caller deadline' -tags=integration
+
+# P2.3 step 1: tenant isolation. Two mutants, two tenancy arrangements, each
+# killing exactly one test. M1 drops the tenant from the ONE derivation every
+# key path shares, so it is self-consistent across write, read, list, and
+# reverse -- a single-deployment suite cannot tell it from the original -- and
+# it is killed by the two-deployment collision. M2 drops the logical prefix
+# filter, which the two-deployment test cannot see because it lists with the
+# empty prefix. Each is the other's control one position over.
+run_mutation tenancy "deployment prefix dropped from every key path" key.go 'func namespaceRoot(deploymentPrefix, namespace string) string {
+	return deploymentPrefix + "/" + namespace
+}' 'func namespaceRoot(deploymentPrefix, namespace string) string {
+	_ = deploymentPrefix
+	return namespace
+}' TestTenantDeploymentsShareOneBucketWithoutCrossing 'conflicted with the alpha tenant' -tags=integration
+# A third arrangement the first two cannot see: payloads staged outside the
+# deployment root. Both tenants still behave correctly on write, read, list and
+# delete -- payload keys carry a random suffix, so they never collide -- and the
+# whole pre-existing suite passes. Only the backend disjointness row catches it,
+# which is why that row is in the test at all.
+run_mutation tenancy "payloads rooted in the deployment prefix" blob.go '	return namespaceRoot(deploymentPrefix, payloadNamespace) + hex.EncodeToString(digest[:]) + "/"' '	return payloadNamespace + hex.EncodeToString(digest[:]) + "/"' TestTenantDeploymentsShareOneBucketWithoutCrossing 'belongs to 0 tenant roots' -tags=integration
+run_mutation tenancy "list logical prefix filter" blob.go 'if !ok || !strings.HasPrefix(logical, prefix) {' 'if !ok {' TestTenantsInOneDeploymentPrefixDoNotCross 'want exactly [tenants/alpha/sessions/s-1701/blobs/o-42]' -tags=integration
+
+# P2.3 step 2: the startup refusal, in both directions, plus the mode
+# vocabulary the refusal names and the recording classification.
+run_mutation encryption "confirmation requirement enforced" encryption.go 'if !required || mode.confirmedByThisModule() {' 'if true {' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'Open returned a Store for a posture the deployment policy forbids'
+run_mutation encryption "confirmation requirement is conditional" encryption.go 'if !required || mode.confirmedByThisModule() {' 'if mode.confirmedByThisModule() {' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'want a Store'
+run_mutation encryption "bucket default is not self-confirmable" encryption.go 'return m == EncryptionAES256 || m == EncryptionKMS' 'return m != EncryptionUnspecified' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'Open returned a Store for a posture the deployment policy forbids'
+# The refusal must be reachable by errors.As from the exported constructor, not
+# merely non-nil. This mutant refuses correctly but with the package's other
+# option error, which only the typed row can see.
+run_mutation encryption "refusal is typed" encryption.go '	return &EncryptionPolicyError{
+		Mode: mode,' '	if true {
+		return invalidOption("Encryption", "requires confirmation")
+	}
+	return &EncryptionPolicyError{
+		Mode: mode,' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'want *EncryptionPolicyError'
+run_mutation encryption "posture vocabulary" encryption.go '	case EncryptionBucketDefault:
+		return "bucket-default"' '	case EncryptionBucketDefault:
+		return "default"' TestEncryptionModeNamesEveryDeclaredPosture 'want "bucket-default"'
+run_mutation encryption "policy error recording classification" redact.go 'var encryptionPolicy *EncryptionPolicyError
+	if errors.As(err, &encryptionPolicy) {' 'var encryptionPolicy *EncryptionPolicyError
+	if false && errors.As(err, &encryptionPolicy) {' TestEncryptionPolicyErrorIsRecordableWithoutIdentifiers 'want the typed classification'
+
+# P2.3 step 2: the header evidence behind confirmedByThisModule, on both the
+# single-part and the multipart write path.
+run_mutation encryption "single-part encryption header" blob.go '		input.ServerSideEncryption = types.ServerSideEncryptionAes256' '		_ = types.ServerSideEncryptionAes256' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'X-Amz-Server-Side-Encryption = ""' -tags=integration
+run_mutation encryption "multipart encryption header" blob.go '		input.ServerSideEncryption = tmtypes.ServerSideEncryptionAes256' '		_ = tmtypes.ServerSideEncryptionAes256' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'X-Amz-Server-Side-Encryption = ""' -tags=integration
+run_mutation encryption "KMS key identifier header" blob.go '		input.SSEKMSKeyId = aws.String(s.options.kmsKeyID)' '		input.SSEKMSKeyId = nil' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'Aws-Kms-Key-Id = ""' -tags=integration
+
+# P2.3 step 3: the orphan precondition. A failed transfer owns no committed
+# payload, so it may delete nothing; and no operation may enumerate uploads.
+# MEASURED, not assumed: weakening EITHER conjunct alone survives this test,
+# because a failed multipart upload leaves payloadOwned AND cleanupSafe both
+# false, so the two are perfectly correlated in this scenario and no guard here
+# can tell them apart. The DeletePayload row therefore detects exactly one
+# thing -- cleanup running when nothing was committed -- and this is the mutant
+# that expresses it. The conjuncts are separated by the protocol group's
+# "unowned payload cleanup exclusion" against TestPutNeverDeletesPayloadItDidNotCreate.
+run_mutation multipart "cleanup requires something committed" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {' 'if payloadOwned || cleanupSafe || ctx.Err() == nil {' TestFailedMultipartUploadIsAbortedAndLeavesNoObject 'payload deletes = ' -tags=integration
+run_mutation multipart "no upload sweep" blob.go '	accounted := newAccountedHashReader(source, s.options.maxAccountedObjectSize)' '	if listed, listErr := s.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(s.options.bucket)}); listErr == nil {
+		for _, stale := range listed.Uploads {
+			_, _ = s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(s.options.bucket), Key: stale.Key, UploadId: stale.UploadId})
+		}
+	}
+	accounted := newAccountedHashReader(source, s.options.maxAccountedObjectSize)' TestNoOrphanCollectionRequestIsIssued 'ListMultipartUploads requests = ' -tags=integration
+# The abort itself is the AWS transfer manager's, not this module's, so no
+# in-repo mutation of the subject can suppress it. This fixture-side mutation
+# proves only that the assertion detects an upload left in progress; it does
+# NOT prove that s3store causes the abort. That limitation is reported.
+run_mutation multipart "abort assertion detects a surviving upload" internal/testserver/server.go '	s.abortedUploads = append(s.abortedUploads, uploadID)
+	delete(s.uploads, uploadID)' '	s.abortedUploads = append(s.abortedUploads, uploadID)' TestFailedMultipartUploadIsAbortedAndLeavesNoObject 'active multipart uploads = ' -tags=integration
 
 restore_snapshot
 rm -rf "$snapshot_dir"

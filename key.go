@@ -15,6 +15,16 @@ const (
 	payloadNamespace    = "payloads/v1/"
 )
 
+// namespaceRoot is the single derivation of a deployment's backend root. Every
+// key this module writes, reverses, or lists is built from it, so the
+// deployment prefix cannot be dropped from one path while surviving in
+// another. Two deployments sharing one bucket are isolated by exactly this
+// component; TestTenantDeploymentsShareOneBucketWithoutCrossing is what proves
+// dropping it is observable.
+func namespaceRoot(deploymentPrefix, namespace string) string {
+	return deploymentPrefix + "/" + namespace
+}
+
 func validateBlobKey(key string) error {
 	return storage.ValidateName(key)
 }
@@ -38,7 +48,7 @@ func manifestObjectKey(deploymentPrefix, logicalKey string) (string, error) {
 		return "", err
 	}
 	digest := sha256.Sum256([]byte(logicalKey))
-	objectKey := deploymentPrefix + "/" + manifestNamespace +
+	objectKey := namespaceRoot(deploymentPrefix, manifestNamespace) +
 		hex.EncodeToString(digest[:]) + "/" +
 		base64.RawURLEncoding.EncodeToString([]byte(logicalKey))
 	if len(objectKey) > maxS3ObjectKeyBytes {
@@ -51,7 +61,7 @@ func manifestObjectKey(deploymentPrefix, logicalKey string) (string, error) {
 // stripping a prefix. A malformed or injected row is foreign data and is
 // ignored independently so it cannot disable the rest of a listing page.
 func logicalKeyFromManifestObject(deploymentPrefix, objectKey string) (string, bool) {
-	root := deploymentPrefix + "/" + manifestNamespace
+	root := namespaceRoot(deploymentPrefix, manifestNamespace)
 	if !strings.HasPrefix(objectKey, root) {
 		return "", false
 	}

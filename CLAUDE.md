@@ -34,7 +34,25 @@ error only.
   encryption mode, multipart sizes, and concurrency before constructing clients.
 - `Encryption` must be stated explicitly. `EncryptionUnspecified` is the zero
   value and is rejected, because an unset field must not license `Open`.
-  `EncryptionBucketDefault` is a declared intent; P2.3 owns live verification.
+  `EncryptionAES256` and `EncryptionKMS` are configured here: every
+  object-creating request carries the header, asserted on all of them, not on
+  one. `EncryptionBucketDefault` sends no header and is a declared intent.
+- `RequireConfirmedEncryption` is the deployment-policy gate. With it set,
+  `Open` refuses `EncryptionBucketDefault` with a typed `*EncryptionPolicyError`
+  reachable by `errors.As`, because `Open` issues no request and so confirms
+  nothing. It is a startup gate only and must never change a header on the wire.
+  Live confirmation against a real service stays behind the `cloud` build tag,
+  is excluded from the default and `integration` paths, and has not been run.
+- Two tenants may share one bucket. `namespaceRoot` is the ONE derivation every
+  key path uses, so the deployment prefix cannot be dropped from one path and
+  survive in another. Tenancy tests construct the collision — identical
+  SessionID and ObjectID, both tenants resident — and assert write, read, list,
+  and delete behaviour; asserting that a key contains the tenant is not enough.
+- There is no orphan collection, hard delete, or GC, and no operation may
+  enumerate multipart uploads. A failed transfer aborts only the upload it
+  created. Deleting an upload merely believed orphaned is forbidden: the proof
+  would have to come from the owning SessionStore retention process, which this
+  provider cannot see.
 - Reject configurations whose accounted transfer buffers,
   `(threshold + (concurrency+1) x partSize) x maxConcurrentTransfers`, exceed
   512 MiB. This is a configuration-time bound on the SDK's steady-state pools,
@@ -64,7 +82,14 @@ error only.
 ## Testing and build
 
 Unit tests require no endpoint. Integration-tagged tests start the disposable
-in-process S3 fixture. Every Go command uses `GOWORK=off`, and tests always run
-with `-race`.
+in-process S3 fixture. `cloud`-tagged tests contact a service this repository
+does not start and are excluded from both paths; never run them against a real
+account without explicit human approval. Every Go command uses `GOWORK=off`,
+and tests always run with `-race`.
 
 Run `make check` and `make test-integration` before each commit.
+
+`scripts/mutation-test.sh` snapshots the files it mutates and restores them.
+Append new mutations BEFORE the trailing `restore_snapshot` / `rm -rf` epilogue;
+anything after it runs with no snapshot, so every restore silently becomes a
+no-op and mutations stack on one another while still reporting KILLED.

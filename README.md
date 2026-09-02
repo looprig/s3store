@@ -22,7 +22,8 @@ foreign or malformed keys.
 
 `Options` requires an S3 endpoint, region, bucket, canonical deployment prefix,
 and an explicit `Encryption` posture: the zero value is rejected so an unset
-field cannot read as an accepted posture. HTTPS is mandatory except for an
+field cannot read as an accepted posture. `RequireConfirmedEncryption` states
+that the deployment policy requires server-side encryption; see below. HTTPS is mandatory except for an
 explicit loopback-only test option; a loopback host is not itself sufficient.
 Addressing style, encryption policy, multipart threshold/part size, per-transfer
 concurrency, and Store-wide concurrent transfers are validated before SDK
@@ -97,15 +98,67 @@ s3store error must pass it through `RedactedErrorText` first, which keeps the
 failure class and the name-grammar rule and drops the identifier. Errors this
 package cannot classify are withheld entirely rather than recorded verbatim.
 
-## Encryption posture and the P2.3 handoff
+## Tenant isolation
 
-`EncryptionBucketDefault` declares an intent to rely on an externally enforced
-bucket policy. Neither P2.1 nor P2.2 can confirm that policy, so selecting it is
-not evidence that objects are encrypted. P2.3 owns verifying required
-server-side encryption headers or bucket policy against a live service and
-failing startup when the deployment requires encryption that cannot be
-confirmed. `EncryptionUnspecified`, the zero value, is rejected outright so an
-unset field never stands in for that verification.
+Two tenants may share one bucket. They are separated by the deployment prefix,
+which is the sole component every backend key path is derived from — manifest
+write, manifest reverse, payload write, payload match, and the listing prefix
+all go through one `namespaceRoot`, so the prefix cannot be dropped from one
+path while surviving in another.
+
+The integration suite constructs the collision rather than asserting the key
+format: two tenants with an **identical SessionID and ObjectID** write, read,
+list, and delete under one bucket. Writing different bytes to the identical
+logical key must not conflict, each read must return its own bytes, neither
+listing may name the other, and deleting one must not disturb the other. The
+same collision is also exercised one position over — one bucket, one deployment
+prefix, tenants separated only by the leading component of the logical key —
+which is where exact-key and exact-prefix behaviour, not the derivation, does
+the work.
+
+## Encryption posture
+
+`Encryption` states the posture and `RequireConfirmedEncryption` states whether
+the deployment policy demands one it can stand behind.
+
+- `EncryptionAES256` and `EncryptionKMS` are configured by this module: every
+  object-creating request it issues — payload `PutObject`, the multipart
+  `CreateMultipartUpload`, and the manifest `PutObject` — carries the
+  corresponding server-side encryption header, which the integration suite
+  asserts on every such request rather than on one representative.
+- `EncryptionBucketDefault` sends no header and delegates to an externally
+  enforced bucket policy. `Open` issues no S3 request, so it confirms nothing
+  about that bucket.
+- `EncryptionUnspecified`, the zero value, is rejected outright.
+
+With `RequireConfirmedEncryption` set, `Open` therefore **refuses to start**
+against `EncryptionBucketDefault`, returning a typed `*EncryptionPolicyError`
+reachable with `errors.As`. The refusal is about the missing confirmation, not
+about the bucket: a correctly configured bucket-default deployment is refused
+too, because nothing available to `Open` distinguishes it from a bucket that
+enforces nothing. The option changes startup only; it does not alter any header
+on the wire.
+
+Confirming a live service's applied encryption or its bucket policy requires an
+endpoint this repository does not create. That check lives in
+`encryption_cloud_test.go` behind the `cloud` build tag, is excluded from both
+`go test ./...` and `go test -tags integration ./...`, skips unless
+`S3STORE_CLOUD_ENDPOINT` and `S3STORE_CLOUD_BUCKET` are set, and **has not been
+executed**.
+
+## Multipart uploads, aborts, and orphans
+
+A multipart upload whose parts fail past the bounded retry classifier is
+aborted, leaves no upload in progress, and commits neither payload nor manifest.
+That abort is the transfer manager's, issued while the upload is still owned by
+the failing `Put`; it is not orphan collection.
+
+There is no orphan collection, hard delete, or GC here, and the tests state that
+as behaviour: no operation enumerates multipart uploads, an upload left open by
+another process is still open afterwards, and an abort never names an upload
+this transfer did not create. Orphan collection would require proving an upload
+unreferenced by the owning SessionStore retention process, which this provider
+cannot see.
 
 ## Development
 
@@ -116,5 +169,7 @@ GOWORK=off go test ./...
 
 Unit tests require no service. Integration-tagged tests start a disposable
 in-process S3-compatible service and exercise shared Storage conformance,
-multipart retry, cancellation, paging, range bounds, integrity failures, and
-concurrent immutable publication.
+tenant isolation, encryption headers, multipart retry and abort, cancellation,
+paging, range bounds, integrity failures, and concurrent immutable publication.
+`cloud`-tagged tests are excluded from both paths and contact a service this
+repository does not start.

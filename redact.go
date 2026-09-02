@@ -45,6 +45,10 @@ func RedactedErrorText(err error) string {
 	if errors.As(err, &unconstructed) {
 		return unconstructed.Error()
 	}
+	var encryptionPolicy *EncryptionPolicyError
+	if errors.As(err, &encryptionPolicy) {
+		return encryptionPolicy.Error()
+	}
 	var backend *BackendError
 	if errors.As(err, &backend) {
 		return backend.Error()
