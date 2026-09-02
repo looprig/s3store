@@ -68,6 +68,17 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 	// deliberately no second "did we upload it" flag: one was tried, and it was
 	// set at the same statement as this one and never narrowed anywhere, so it
 	// was a structurally dead conjunct that no test could separate.
+	//
+	// ctx.Err() is NOT part of that precondition and is not held by any probe.
+	// It is a request-saving short-circuit: deletePayloadBestEffort passes ctx
+	// straight to DeleteObject, so on a canceled context the request fails
+	// without reaching the service anyway, and removing this conjunct changes
+	// no outcome a test can observe. It is kept because issuing a request that
+	// is known to fail is worse than not issuing it, and it is named here
+	// rather than probed because there is nothing to probe. What DOES matter --
+	// that cleanup never runs on a detached context that outlives the caller --
+	// is a separate rule, held by
+	// TestPutVerificationCancellationDoesNotStartDetachedCleanup.
 	cleanupSafe := false
 	defer func() {
 		if cleanupSafe && ctx.Err() == nil {

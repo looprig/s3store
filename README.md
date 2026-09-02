@@ -209,6 +209,9 @@ make check
 GOWORK=off go test ./...
 ```
 
+`make check` also runs `vet`, `staticcheck`, and `gosec` under the `integration`
+and `cloud` tags, and CI runs `make test-integration`.
+
 Unit tests require no service. Integration-tagged tests start a disposable
 in-process S3-compatible service and exercise shared Storage conformance,
 tenant isolation, encryption headers, multipart retry and abort, cancellation,

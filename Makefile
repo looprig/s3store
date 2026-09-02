@@ -17,12 +17,21 @@ fmt-check:
 
 vet:
 	GOWORK=off go vet ./...
+	GOWORK=off go vet -tags integration ./...
+	GOWORK=off go vet -tags cloud ./...
 
+# Tagged files are compiled by no untagged analysis, so the integration and
+# cloud tests would be unlinted by default. The cloud test is the one that never
+# runs anywhere, which makes lint the only thing standing between it and rot.
 staticcheck:
 	GOWORK=off go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+	GOWORK=off go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -tags integration ./...
+	GOWORK=off go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -tags cloud ./...
 
 gosec:
 	GOWORK=off go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet $(GO_DIRS)
+	GOWORK=off go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet -tags integration $(GO_DIRS)
+	GOWORK=off go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet -tags cloud $(GO_DIRS)
 
 vuln:
 	GOWORK=off go mod verify

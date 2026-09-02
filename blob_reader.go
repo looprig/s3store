@@ -66,6 +66,14 @@ var errBlobReaderClosed error = &BlobReaderClosedError{}
 // Read and Close share no lock. Serializing them on one mutex would make Close
 // wait for a blocked network Read, which is the exact outcome the capability
 // exists to forbid; the only shared state is an atomic flag and two sync.Onces.
+//
+// The consequence, which the contract permits and this type does not hide:
+// Read is NOT safe against another Read. storage.BlobReaderLifecycle requires
+// only that Read and Close be safe together, and the verifier behind this type
+// keeps its offset, hash, and terminal error unsynchronized. memstore, whose
+// single mutex serializes everything, IS safe against concurrent Reads, so a
+// consumer that reads one blob from several goroutines will work there and
+// race here. One goroutine per reader.
 type blobReader struct {
 	verifier *verifyingBlobReader
 	// abort cancels the context the payload request was issued with. It is one

@@ -332,6 +332,35 @@ run_mutation encryption "refusal is typed" encryption.go '	return &EncryptionPol
 	}
 	return &EncryptionPolicyError{
 		Mode: mode,' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'want *EncryptionPolicyError'
+# requireConfirmedEncryption documents that it runs AFTER the unset posture has
+# been rejected. Hoisting it above that rejection refuses startup either way,
+# so nothing insecure ships -- what breaks is the diagnosis: an operator who
+# forgot to set Encryption is told their posture is enforced by an external
+# bucket policy, which is false for a mode no policy backs.
+run_mutation encryption "policy check follows the unset rejection" options.go '	if o.Encryption == EncryptionUnspecified {
+		return resolvedOptions{}, invalidOption("Encryption", "must be set explicitly; the zero value is not an accepted posture")
+	}
+	if o.Encryption > EncryptionKMS {
+		return resolvedOptions{}, invalidOption("Encryption", "has an unknown mode")
+	}
+	if err := validateKMSKey(o.Encryption, o.KMSKeyID); err != nil {
+		return resolvedOptions{}, err
+	}
+	if err := requireConfirmedEncryption(o.RequireConfirmedEncryption, o.Encryption); err != nil {
+		return resolvedOptions{}, err
+	}' '	if err := requireConfirmedEncryption(o.RequireConfirmedEncryption, o.Encryption); err != nil {
+		return resolvedOptions{}, err
+	}
+	if o.Encryption == EncryptionUnspecified {
+		return resolvedOptions{}, invalidOption("Encryption", "must be set explicitly; the zero value is not an accepted posture")
+	}
+	if o.Encryption > EncryptionKMS {
+		return resolvedOptions{}, invalidOption("Encryption", "has an unknown mode")
+	}
+	if err := validateKMSKey(o.Encryption, o.KMSKeyID); err != nil {
+		return resolvedOptions{}, err
+	}' TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt 'want *OptionsError for an unset posture'
+
 run_mutation encryption "posture vocabulary" encryption.go '	case EncryptionBucketDefault:
 		return "bucket-default"' '	case EncryptionBucketDefault:
 		return "default"' TestEncryptionModeNamesEveryDeclaredPosture 'want "bucket-default"'

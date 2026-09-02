@@ -110,7 +110,13 @@ does not start and are excluded from both paths; never run them against a real
 account without explicit human approval. Every Go command uses `GOWORK=off`,
 and tests always run with `-race`.
 
-Run `make check` and `make test-integration` before each commit.
+Run `make check` and `make test-integration` before each commit. CI runs both:
+the integration suite is where the reader-lifecycle mechanism is actually
+measured, and sessionstore accepts this backend on the strength of that
+measurement, so it may not be a local-only run. `vet`, `staticcheck`, and
+`gosec` each run untagged and again under `integration` and `cloud`, because a
+tagged file is compiled by no untagged analysis and the cloud test -- which
+executes nowhere -- would otherwise be unlinted.
 
 `scripts/mutation-test.sh` snapshots the files it mutates and restores them.
 Append new mutations BEFORE the trailing `restore_snapshot` / `rm -rf` epilogue;

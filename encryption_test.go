@@ -13,6 +13,28 @@ import (
 // it is applied to, so neither the requirement nor the exemption can be deleted
 // unnoticed. The refusal is asserted through the exported constructor because
 // that is where a deployment meets it.
+//
+// It also pins WHICH refusal an unset posture gets. requireConfirmedEncryption
+// documents that it runs after EncryptionUnspecified has been rejected; without
+// the unset row that is an unprobed ordering precondition, and hoisting the
+// call above the rejection leaves every test passing. Both orders refuse
+// startup, so nothing insecure ships -- what breaks is the diagnosis. An
+// operator who forgot to set Encryption would be told that their posture "is
+// enforced by an external bucket policy that Open cannot confirm", which is
+// false for a mode no bucket policy backs, and which points at the bucket
+// instead of at the field they left unset.
+type encryptionOutcome uint8
+
+const (
+	// openAccepted expects a Store.
+	openAccepted encryptionOutcome = iota
+	// openRefusedByPolicy expects *EncryptionPolicyError.
+	openRefusedByPolicy
+	// openRefusedAsUnset expects the *OptionsError for an unset posture, and
+	// expressly NOT *EncryptionPolicyError.
+	openRefusedAsUnset
+)
+
 func TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -20,15 +42,20 @@ func TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt(t *testing.T) {
 		required     bool
 		mode         EncryptionMode
 		kmsKeyID     string
-		wantRefusal  bool
+		want         encryptionOutcome
 		wantModeText string
 	}{
 		{name: "policy requires and s3store configures AES256", required: true, mode: EncryptionAES256},
 		{name: "policy requires and s3store configures KMS", required: true, mode: EncryptionKMS, kmsKeyID: "alias/looprig"},
 		{
 			name: "policy requires but the bucket-default posture is unconfirmable", required: true,
-			mode: EncryptionBucketDefault, wantRefusal: true, wantModeText: "bucket-default",
+			mode: EncryptionBucketDefault, want: openRefusedByPolicy, wantModeText: "bucket-default",
 		},
+		{
+			name: "policy requires and the posture is unset", required: true,
+			mode: EncryptionUnspecified, want: openRefusedAsUnset,
+		},
+		{name: "no policy requirement leaves the posture unset and still rejected", mode: EncryptionUnspecified, want: openRefusedAsUnset},
 		{name: "no policy requirement leaves the bucket-default posture accepted", mode: EncryptionBucketDefault},
 		{name: "no policy requirement leaves AES256 accepted", mode: EncryptionAES256},
 	}
@@ -42,7 +69,7 @@ func TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			store, err := Open(ctx, options)
-			if !testCase.wantRefusal {
+			if testCase.want == openAccepted {
 				if err != nil {
 					t.Fatalf("Open = %v, want a Store", err)
 				}
@@ -55,6 +82,19 @@ func TestOpenRefusesUnconfirmableEncryptionWhenPolicyRequiresIt(t *testing.T) {
 				t.Fatalf("Open returned a Store for a posture the deployment policy forbids")
 			}
 			var policy *EncryptionPolicyError
+			if testCase.want == openRefusedAsUnset {
+				var options *OptionsError
+				if !errors.As(err, &options) {
+					t.Fatalf("Open = %v (%T), want *OptionsError for an unset posture", err, err)
+				}
+				if options.Field != "Encryption" {
+					t.Errorf("OptionsError.Field = %q, want %q", options.Field, "Encryption")
+				}
+				if errors.As(err, &policy) {
+					t.Fatalf("an unset posture was refused as %v; the deployment-policy refusal claims an external bucket policy that no unset posture has, and points the operator away from the field they left unset", err)
+				}
+				return
+			}
 			if !errors.As(err, &policy) {
 				t.Fatalf("Open = %v (%T), want *EncryptionPolicyError", err, err)
 			}

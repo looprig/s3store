@@ -15,8 +15,9 @@ type DeadlineRequiredError = guard.DeadlineRequiredError
 type NotImplementedError = guard.NotImplementedError
 type UnconstructedStoreError = guard.UnconstructedStoreError
 
-// Store implements only storage.Blobs. Structured primitives and SessionStore
-// composition deliberately live in other modules.
+// Store implements storage.Blobs and the optional storage.BlobReaderLifecycle
+// capability. Structured primitives and SessionStore composition deliberately
+// live in other modules.
 type Store struct {
 	client    *s3.Client
 	transfers *transfermanager.Client

@@ -23,3 +23,11 @@ jobs:
         run: make check
       - name: Standalone verification
         run: GOWORK=off go test ./...
+      # The integration suite is where the bounded-reader-lifecycle mechanism is
+      # measured: TestCloseUnblocksAStalledPayloadRead stalls a real payload
+      # response mid-body and requires Close to return and the blocked Read to
+      # land inside the advertised bound. sessionstore accepts this backend on
+      # the strength of that measurement, so it may not be a local-only run. The
+      # fixture is in-process; nothing here contacts a service.
+      - name: Integration verification
+        run: make test-integration
