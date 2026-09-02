@@ -1,8 +1,9 @@
 # s3store
 
 `s3store` is Looprig's S3-compatible provider for the immutable
-`storage.Blobs` primitive. It deliberately does not implement Ledger, Leaser,
-KV, OrderedIndex, or SessionStore. A cloud composition combines this provider
+`storage.Blobs` primitive and its optional `storage.BlobReaderLifecycle`
+capability. It deliberately does not implement Ledger, Leaser, KV,
+OrderedIndex, or SessionStore. A cloud composition combines this provider
 with the structured primitives from `pgstore`.
 
 `Open` validates configuration and constructs lazy AWS SDK clients without
@@ -84,9 +85,38 @@ _ = primitive
 ```
 
 Do not log `Options`, injected provider failures, request authorization, or
-presigned URLs when reporting an `Open` failure. `Store` exposes only the four
-`storage.Blobs` methods and never mints a public or signed URL; Factory owns
-authorization and streaming to clients.
+presigned URLs when reporting an `Open` failure. `Store` exposes the four
+`storage.Blobs` methods plus `BlobReaderCloseBound`, and never mints a public or
+signed URL; Factory owns authorization and streaming to clients.
+
+## Bounded reader shutdown
+
+`Store` implements `storage.BlobReaderLifecycle`, which `sessionstore.Open`
+requires of any Blobs provider before it will construct a store. The capability
+is a claim about a mechanism, not a promise about a number:
+
+- **`Close` releases a blocked `Read`.** It cancels the context the payload
+  request was issued with and closes the response body. Either one alone was
+  measured to release a `Read` stalled on a socket; both are done, because the
+  cancellation reaches the transport through any SDK body wrapper while the
+  body `Close` is the documented way to release the response.
+- **`Close` never waits for a `Read`.** Read and Close share no lock. This is
+  the reason the reader does not use memstore's single-mutex design: that would
+  make `Close` block behind a stalled network read, which is what the capability
+  exists to prevent.
+- **`Close` is latched.** The first call computes the result; every later call
+  returns that same value and does not close the body again.
+- **No `Read` after `Close` returns bytes or `io.EOF`.** It returns
+  `*BlobReaderClosedError`, which matches `fs.ErrClosed` and never `io.EOF`. The
+  distinction is load-bearing for consumers: sessionstore compares bare `io.EOF`
+  by identity to mean "verified through terminal EOF", so a torn-down stream
+  answering `io.EOF` would be recorded as verified content.
+
+`BlobReaderCloseBound` is a conservative constant, not a measurement. What is
+measured is the mechanism: a fixture serves a short prefix of a payload and then
+stops writing, so a real `Read` blocks on a real socket, and the test requires
+`Close` to return and the blocked `Read` to land with a non-EOF error inside the
+advertised bound.
 
 ## Recording errors
 

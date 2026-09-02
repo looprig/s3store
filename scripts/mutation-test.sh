@@ -7,7 +7,7 @@ shards=${3:-1}
 mutation_index=0
 killed=0
 snapshot_dir="/private/tmp/s3store-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go s3store.go blob.go blob_io.go manifest.go key.go transfer.go redact.go encryption.go blob_test.go internal/guard/guard.go internal/testserver/server.go"
+files="go.mod options.go s3store.go blob.go blob_io.go blob_reader.go manifest.go key.go transfer.go redact.go encryption.go blob_test.go internal/guard/guard.go internal/testserver/server.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -209,13 +209,10 @@ run_mutation interfaces "Ledger exclusion" blob.go '// Put stages' 'func (s *Sto
 func (s *Store) Read(context.Context, string, uint64) (storage.Cursor, error) { return nil, nil }
 func (s *Store) Tip(context.Context, string) (uint64, error) { return 0, nil }
 
-// Put stages' TestStoreImplementsOnlyBlobs 'Store implements storage.Ledger'
+// Put stages' TestStoreImplementsBlobsAndTheReaderLifecycleOnly 'Store implements storage.Ledger'
 run_mutation interfaces "Leaser exclusion" blob.go '// Put stages' 'func (s *Store) Acquire(context.Context, string) (storage.Lease, error) { return nil, nil }
 
-// Put stages' TestStoreImplementsOnlyBlobs 'Store implements storage.Leaser'
-run_mutation interfaces "BlobReaderLifecycle exclusion" blob_test.go '// TestStoreImplementsOnlyBlobs asserts' 'func (s *Store) BlobReaderCloseBound() time.Duration { return time.Second }
-
-// TestStoreImplementsOnlyBlobs asserts' TestStoreImplementsOnlyBlobs 'Store implements storage.BlobReaderLifecycle'
+// Put stages' TestStoreImplementsBlobsAndTheReaderLifecycleOnly 'Store implements storage.Leaser'
 
 run_mutation security "invalid-name key redaction" redact.go 'return "s3store: invalid storage name: " + invalidName.Rule' 'return err.Error()' TestRedactedErrorTextDropsTenantScopedIdentifiers 'recorded text disclosed'
 run_mutation security "classification survives wrapping" redact.go 'var invalidName *storage.InvalidNameError
@@ -368,6 +365,51 @@ run_mutation multipart "no upload sweep" blob.go '	accounted := newAccountedHash
 # NOT prove that s3store causes the abort. That limitation is reported.
 run_mutation multipart "abort assertion detects a surviving upload" internal/testserver/server.go '	s.abortedUploads = append(s.abortedUploads, uploadID)
 	delete(s.uploads, uploadID)' '	s.abortedUploads = append(s.abortedUploads, uploadID)' TestFailedMultipartUploadIsAbortedAndLeavesNoObject 'active multipart uploads = ' -tags=integration
+
+# P2.3 follow-up: the bounded reader lifecycle. Each rule is probed at the layer
+# that can SEE it. Over a real HTTP body every one of these mutations was
+# measured and SURVIVED the whole integration suite: aborting the request and
+# closing the body each unblock a stalled Read alone, net/http's body Close is
+# already idempotent, and the two closed checks are interchangeable once Close
+# has returned. The integration probe below therefore holds only the property
+# that is genuinely emergent -- that a stalled Read is released at all -- and
+# the parts are held by synthetic fixtures in blob_reader_test.go.
+run_mutation lifecycle "Close aborts the request" blob_reader.go '		r.abort()
+		r.closeErr = r.verifier.Close()' '		r.closeErr = r.verifier.Close()' TestCloseInvokesBothReleaseMechanismsExactlyOnce 'request aborts = 0, want exactly 1'
+run_mutation lifecycle "Close closes the body" blob_reader.go '		r.closeErr = r.verifier.Close()' '		r.closeErr = nil' TestCloseInvokesBothReleaseMechanismsExactlyOnce 'body closes = 0, want exactly 1'
+run_mutation lifecycle "Close neither aborts nor closes" blob_reader.go '		r.abort()
+		r.closeErr = r.verifier.Close()' '		r.closeErr = nil' TestCloseUnblocksAStalledPayloadRead 'did not return within the advertised' -tags=integration
+run_mutation lifecycle "Close is latched" blob_reader.go '	r.closeOnce.Do(func() {
+		r.closed.Store(true)
+		r.abort()
+		r.closeErr = r.verifier.Close()
+		r.releaseOnce.Do(r.release)
+	})
+	return r.closeErr' '	r.closed.Store(true)
+	r.abort()
+	err := r.verifier.Close()
+	r.releaseOnce.Do(r.release)
+	return err' TestCloseClassificationIsLatchedAcrossAnUnstableBody 'want the latched'
+run_mutation lifecycle "closed check precedes the verifier" blob_reader.go '	if r.closed.Load() {
+		return 0, errBlobReaderClosed
+	}
+	n, err := r.verifier.Read(buffer)' '	n, err := r.verifier.Read(buffer)' TestReadAfterCloseDoesNotConsultAnUnresponsiveBody 'it reached a body that never answers'
+run_mutation lifecycle "closed check follows the verifier" blob_reader.go '	n, err := r.verifier.Read(buffer)
+	if r.closed.Load() {' '	n, err := r.verifier.Read(buffer)
+	if false && r.closed.Load() {' TestReadInFlightWhenCloseBeginsIsTerminal 'bytes after Close, want 0'
+# There is deliberately no mutation for the ORDER of the closed store against
+# the teardown inside Close. It was probed (deferring the store to the end of
+# Close) and SURVIVED, and it should have: the contract constrains Reads after
+# Close RETURNS, and the flag is set before Close returns either way. A test for
+# it would have to race the teardown against the blocked Read.
+run_mutation lifecycle "positive close bound" blob_reader.go 'const blobReaderCloseBound = 5 * time.Second' 'const blobReaderCloseBound = 0' TestBlobReaderLifecycleConformance 'want positive duration' -tags=integration
+run_mutation lifecycle "closed error is not EOF" blob_reader.go 'var errBlobReaderClosed error = &BlobReaderClosedError{}' 'var errBlobReaderClosed error = io.EOF' TestReadAfterCloseNeverReportsEOFOnADrainedStream 'want 0 and a non-EOF fs.ErrClosed error'
+run_mutation lifecycle "transfer slot released once" blob_reader.go '	r.releaseOnce.Do(r.release)
+	})' '	r.release()
+	})' TestReadAfterCloseNeverReportsEOFOnADrainedStream 'want exactly 1 across terminal read and Close'
+run_mutation lifecycle "closed error recording classification" redact.go '	var readerClosed *BlobReaderClosedError
+	if errors.As(err, &readerClosed) {' '	var readerClosed *BlobReaderClosedError
+	if false && errors.As(err, &readerClosed) {' TestBlobReaderClosedErrorIsRecordable 'want the typed classification'
 
 restore_snapshot
 rm -rf "$snapshot_dir"

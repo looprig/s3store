@@ -41,6 +41,14 @@ type commitBlock struct {
 	committed chan struct{}
 }
 
+// payloadStall is a payload GET that sends its headers and a short prefix of
+// the body and then stops writing, without closing the connection. It is the
+// only way to make a client Read block on genuine network I/O in-process.
+type payloadStall struct {
+	prefix  int
+	stalled chan struct{}
+}
+
 // Server is an isolated S3-compatible service with in-memory object state.
 type Server struct {
 	http *httptest.Server
@@ -54,6 +62,7 @@ type Server struct {
 	blocks          map[string][]*requestBlock
 	commitBlocks    map[string][]*commitBlock
 	commitFaults    map[string][]fault
+	payloadStalls   []*payloadStall
 	createdUploads  []string
 	abortedUploads  []string
 	objectHeaders   map[string][]http.Header
@@ -190,6 +199,20 @@ func (s *Server) SetPageLimit(limit int) {
 	s.mu.Lock()
 	s.pageLimit = limit
 	s.mu.Unlock()
+}
+
+// StallNextPayloadRead makes the next unranged payload GET write its headers
+// and prefix bytes, flush them, and then stop writing until the request context
+// is canceled. The returned channel is closed once the response has stalled, so
+// a test can wait for the stall rather than sleeping. The declared
+// Content-Length remains the full object, so the client is left waiting for
+// bytes that never come.
+func (s *Server) StallNextPayloadRead(prefix int) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stall := &payloadStall{prefix: prefix, stalled: make(chan struct{})}
+	s.payloadStalls = append(s.payloadStalls, stall)
+	return stall.stalled
 }
 
 // PutRaw inserts foreign fixture data without going through the SDK.
@@ -427,6 +450,19 @@ func (s *Server) getObject(writer http.ResponseWriter, request *http.Request, bu
 	}
 	body := stored.body
 	writer.Header().Set("ETag", stored.etag)
+	if request.Header.Get("Range") == "" && strings.Contains(key, "/payloads/v1/") {
+		s.mu.Lock()
+		var stall *payloadStall
+		if queued := s.payloadStalls; len(queued) > 0 {
+			stall = queued[0]
+			s.payloadStalls = queued[1:]
+		}
+		s.mu.Unlock()
+		if stall != nil {
+			s.stallPayload(writer, request, body, stall)
+			return
+		}
+	}
 	if match := request.Header.Get("If-Match"); match != "" && match != stored.etag {
 		writeError(writer, http.StatusPreconditionFailed, "PreconditionFailed")
 		return
@@ -448,6 +484,20 @@ func (s *Server) getObject(writer http.ResponseWriter, request *http.Request, bu
 	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(body)
+}
+
+func (s *Server) stallPayload(writer http.ResponseWriter, request *http.Request, body []byte, stall *payloadStall) {
+	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	writer.WriteHeader(http.StatusOK)
+	prefix := min(stall.prefix, len(body))
+	if prefix > 0 {
+		_, _ = writer.Write(body[:prefix])
+	}
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	close(stall.stalled)
+	<-request.Context().Done()
 }
 
 func parseRange(value string, length int) (int, int, bool) {

@@ -26,12 +26,31 @@ func TestOpenRequiresDeadline(t *testing.T) {
 	}
 }
 
-// TestStoreImplementsOnlyBlobs asserts the whole cross product the README and
-// CLAUDE.md claim, not one representative of it, so P2.2 cannot widen the
-// surface without failing here.
-func TestStoreImplementsOnlyBlobs(t *testing.T) {
+// TestStoreImplementsBlobsAndTheReaderLifecycleOnly asserts the whole cross
+// product the README and CLAUDE.md claim, not one representative of it, so no
+// later task can widen the surface without failing here.
+//
+// BlobReaderLifecycle moved from the excluded side to the required side. It was
+// only ever excluded as part of this scope guard -- nothing in the module gave
+// an S3-specific reason to refuse it, unlike fsstore, whose refusal is an
+// inability. Its exclusion is now a positive claim with its own conformance
+// suite and its own blocked-I/O probe, so exclusion here would be a silent
+// regression rather than a narrowing.
+func TestStoreImplementsBlobsAndTheReaderLifecycleOnly(t *testing.T) {
 	var _ storage.Blobs = (*Store)(nil)
+	var _ storage.BlobReaderLifecycle = (*Store)(nil)
 	store := any((*Store)(nil))
+	lifecycle, ok := store.(storage.BlobReaderLifecycle)
+	if !ok {
+		t.Fatal("Store does not implement storage.BlobReaderLifecycle; sessionstore.Open rejects such a provider before any I/O")
+	}
+	// The bound is a constant of the type, not of an instance, so the typed-nil
+	// Store above answers it. That also keeps this test out of the
+	// unconstructed-Store guard, which forbids building a Store any other way
+	// than through newStore.
+	if bound := lifecycle.BlobReaderCloseBound(); bound <= 0 {
+		t.Errorf("BlobReaderCloseBound() = %v, want a positive documented bound", bound)
+	}
 	excluded := []struct {
 		name  string
 		check func(any) bool
@@ -40,11 +59,10 @@ func TestStoreImplementsOnlyBlobs(t *testing.T) {
 		{"storage.Leaser", func(v any) bool { _, ok := v.(storage.Leaser); return ok }},
 		{"storage.KV", func(v any) bool { _, ok := v.(storage.KV); return ok }},
 		{"storage.OrderedIndex", func(v any) bool { _, ok := v.(storage.OrderedIndex); return ok }},
-		{"storage.BlobReaderLifecycle", func(v any) bool { _, ok := v.(storage.BlobReaderLifecycle); return ok }},
 	}
 	for _, interfaceCase := range excluded {
 		if interfaceCase.check(store) {
-			t.Errorf("Store implements %s; s3store is Blobs-only and claims no optional capability", interfaceCase.name)
+			t.Errorf("Store implements %s; s3store provides Blobs and the reader lifecycle only", interfaceCase.name)
 		}
 	}
 	typeOfStore := reflect.TypeOf((*Store)(nil))
@@ -52,9 +70,9 @@ func TestStoreImplementsOnlyBlobs(t *testing.T) {
 	for index := 0; index < typeOfStore.NumMethod(); index++ {
 		methods = append(methods, typeOfStore.Method(index).Name)
 	}
-	wantMethods := []string{"Delete", "Get", "List", "Put"}
+	wantMethods := []string{"BlobReaderCloseBound", "Delete", "Get", "List", "Put"}
 	if !reflect.DeepEqual(methods, wantMethods) {
-		t.Fatalf("exported Store methods = %v, want only storage.Blobs %v; signed/public URL APIs belong in Factory", methods, wantMethods)
+		t.Fatalf("exported Store methods = %v, want exactly %v; signed/public URL APIs belong in Factory", methods, wantMethods)
 	}
 }
 

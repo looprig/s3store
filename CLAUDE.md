@@ -1,7 +1,8 @@
 # CLAUDE.md — s3store
 
-`s3store` implements only [`storage`](../storage)'s immutable Blobs primitive
-over an S3-compatible service. PostgreSQL structured primitives belong to
+`s3store` implements [`storage`](../storage)'s immutable Blobs primitive over
+an S3-compatible service, plus the optional `BlobReaderLifecycle` capability
+that `sessionstore.Open` requires of a Blobs provider. PostgreSQL structured primitives belong to
 `pgstore`; SessionStore and composite assembly belong to consumers.
 
 ## Dependencies
@@ -78,6 +79,20 @@ error only.
   are replayable.
 - Never add a signed/public URL method. Factory authorizes logical reads and
   streams the returned reader.
+- `Store` implements `storage.BlobReaderLifecycle`. Four rules hold it, each
+  probed at the layer that can see it: `Close` both cancels the payload
+  request context and closes the body; `Close` shares no lock with `Read`, so it
+  never waits for one; `Close` is latched and classification-stable; and no
+  `Read` after `Close` returns bytes or `io.EOF` -- it returns
+  `*BlobReaderClosedError`, matching `fs.ErrClosed`. The EOF rule is not
+  cosmetic: sessionstore compares bare `io.EOF` by identity to mean verified
+  content. Do NOT adopt memstore's single-mutex Read/Close serialization; it
+  makes `Close` wait for a blocked network read.
+- Over a real HTTP body most of those parts mask each other -- abort and body
+  Close each unblock a stalled read alone, net/http Close is idempotent, and
+  the two closed checks are interchangeable after Close returns. They are held
+  by synthetic fixtures in `blob_reader_test.go`, not by the integration probe,
+  which holds only the emergent property that a stalled read is released.
 
 ## Testing and build
 

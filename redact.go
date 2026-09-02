@@ -45,6 +45,10 @@ func RedactedErrorText(err error) string {
 	if errors.As(err, &unconstructed) {
 		return unconstructed.Error()
 	}
+	var readerClosed *BlobReaderClosedError
+	if errors.As(err, &readerClosed) {
+		return readerClosed.Error()
+	}
 	var encryptionPolicy *EncryptionPolicyError
 	if errors.As(err, &encryptionPolicy) {
 		return encryptionPolicy.Error()

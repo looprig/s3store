@@ -11,7 +11,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -171,10 +170,17 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+	// The payload request gets its own cancelable child of the caller context.
+	// The caller's cancellation still reaches the stream, and Close gains an
+	// unconditional way to abort a Read blocked on the socket, which is what
+	// BlobReaderCloseBound promises. readCtx is canceled on every path that
+	// does not hand the body to a blobReader.
+	readCtx, abortRead := context.WithCancel(ctx)
+	output, err := s.client.GetObject(readCtx, &s3.GetObjectInput{
 		Bucket: aws.String(s.options.bucket), Key: aws.String(manifest.PayloadKey),
 	})
 	if err != nil {
+		abortRead()
 		if isHTTPStatus(err, 404) {
 			return nil, integrityError("payload lookup")
 		}
@@ -187,11 +193,12 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 		if output.Body != nil {
 			_ = output.Body.Close()
 		}
+		abortRead()
 		return nil, integrityError("payload head")
 	}
 	verifier := newVerifyingBlobReader(output.Body, manifest.Size, manifest.Digest)
 	release = false
-	return &slotReleasingReader{reader: verifier, release: s.releaseTransfer}, nil
+	return newBlobReader(verifier, abortRead, s.releaseTransfer), nil
 }
 
 // Delete removes the logical manifest first. Payload cleanup cannot make the
@@ -473,24 +480,4 @@ func isConditionalConflict(err error) bool {
 func isHTTPStatus(err error, status int) bool {
 	var responseError *awshttp.ResponseError
 	return errors.As(err, &responseError) && responseError.HTTPStatusCode() == status
-}
-
-type slotReleasingReader struct {
-	reader  io.ReadCloser
-	release func()
-	once    sync.Once
-}
-
-func (r *slotReleasingReader) Read(buffer []byte) (int, error) {
-	n, err := r.reader.Read(buffer)
-	if err != nil {
-		r.once.Do(r.release)
-	}
-	return n, err
-}
-
-func (r *slotReleasingReader) Close() error {
-	err := r.reader.Close()
-	r.once.Do(r.release)
-	return err
 }
