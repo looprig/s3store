@@ -65,11 +65,9 @@ func TestFailedMultipartUploadIsAbortedAndLeavesNoObject(t *testing.T) {
 	// The payload was never committed, so there is nothing this Put may delete.
 	//
 	// Measured scope: the mutation this row kills is "cleanup requires
-	// something committed" -- the guard fired unconditionally. It does NOT
-	// separate the two conjuncts of that guard: a failed multipart upload
-	// leaves payloadOwned and cleanupSafe both false, so weakening either one
-	// alone survives here, as the campaign records. The conjuncts are
-	// separated by TestPutNeverDeletesPayloadItDidNotCreate instead.
+	// something committed" -- the guard firing when nothing was uploaded. It
+	// says nothing about which payload is deleted once one exists; that is
+	// TestPutNeverDeletesPayloadItDidNotCreate.
 	if deletes := server.Count("DeletePayload"); deletes != 0 {
 		t.Errorf("payload deletes = %d, want 0; a failed upload owns no committed payload to reclaim", deletes)
 	}

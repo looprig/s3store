@@ -63,10 +63,15 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 	if err != nil {
 		return err
 	}
-	payloadOwned := false
+	// cleanupSafe carries the whole precondition: this Put uploaded payloadKey
+	// AND nothing durable references it. It starts false because nothing has
+	// been uploaded, and it is narrowed again once publication begins. There is
+	// deliberately no second "did we upload it" flag: one was tried, and it was
+	// set at the same statement as this one and never narrowed anywhere, so it
+	// was a structurally dead conjunct that no test could separate.
 	cleanupSafe := false
 	defer func() {
-		if payloadOwned && cleanupSafe && ctx.Err() == nil {
+		if cleanupSafe && ctx.Err() == nil {
 			s.deletePayloadBestEffort(ctx, payloadKey)
 		}
 	}()
@@ -88,7 +93,6 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 		}
 		return &BackendError{Operation: "payload upload"}
 	}
-	payloadOwned = true
 	cleanupSafe = true
 	size := accounted.Size()
 	digest := accounted.Digest()

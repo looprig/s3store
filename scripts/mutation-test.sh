@@ -288,13 +288,13 @@ run_mutation protocol "immutable range ETag" blob.go 'Range: aws.String(fmt.Spri
 run_mutation protocol "list every page" blob.go 'if !aws.ToBool(output.IsTruncated) {' 'if true || !aws.ToBool(output.IsTruncated) {' TestListPagesPastMalformedRow 'List =' -tags=integration
 run_mutation protocol "Get holds transfer slot" blob.go 'release = false' 'release = true' TestOpenGetReaderHoldsTransferSlotUntilClose 'want context.DeadlineExceeded' -tags=integration
 run_mutation protocol "conflict digest comparison" blob.go 'left.Size == right.Size && equalDigest(left.Digest[:], right.Digest[:])' 'left.Size == right.Size' TestBlobsIntegrationConformance 'want *BlobConflictError' -tags=integration
-run_mutation protocol "unowned payload cleanup exclusion" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {' 'if !payloadOwned && !cleanupSafe && ctx.Err() == nil {' TestPutNeverDeletesPayloadItDidNotCreate 'want 0 for a payload this writer never created' -tags=integration
+run_mutation protocol "unowned payload cleanup exclusion" blob.go 'if cleanupSafe && ctx.Err() == nil {' 'if !cleanupSafe && ctx.Err() == nil {' TestPutNeverDeletesPayloadItDidNotCreate 'want 0 for a payload this writer never created' -tags=integration
 run_mutation protocol "ambiguous manifest payload preservation" blob.go 'cleanupSafe = false
 	created, publishErr := s.publishManifest' 'cleanupSafe = true
 	created, publishErr := s.publishManifest' TestPutPreservesPayloadWhenManifestPublicationIsAmbiguous 'blob integrity verification failed during payload lookup' -tags=integration
-run_mutation protocol "cleanup caller deadline" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {
+run_mutation protocol "cleanup caller deadline" blob.go 'if cleanupSafe && ctx.Err() == nil {
 			s.deletePayloadBestEffort(ctx, payloadKey)
-		}' 'if payloadOwned && cleanupSafe {
+		}' 'if cleanupSafe {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5_000_000_000)
 			defer cancel()
 			s.deletePayloadBestEffort(cleanupCtx, payloadKey)
@@ -347,17 +347,15 @@ run_mutation encryption "policy error recording classification" redact.go 'var e
 run_mutation encryption "single-part encryption header" blob.go '		input.ServerSideEncryption = types.ServerSideEncryptionAes256' '		_ = types.ServerSideEncryptionAes256' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'X-Amz-Server-Side-Encryption = ""' -tags=integration
 run_mutation encryption "multipart encryption header" blob.go '		input.ServerSideEncryption = tmtypes.ServerSideEncryptionAes256' '		_ = tmtypes.ServerSideEncryptionAes256' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'X-Amz-Server-Side-Encryption = ""' -tags=integration
 run_mutation encryption "KMS key identifier header" blob.go '		input.SSEKMSKeyId = aws.String(s.options.kmsKeyID)' '		input.SSEKMSKeyId = nil' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'Aws-Kms-Key-Id = ""' -tags=integration
+# The multipart path has its own KMS field, spelled SSEKMSKeyID rather than
+# SSEKMSKeyId. It had no recorded probe; this is it.
+run_mutation encryption "multipart KMS key identifier header" blob.go '		input.SSEKMSKeyID = aws.String(s.options.kmsKeyID)' '		input.SSEKMSKeyID = nil' TestEveryObjectCreatingRequestCarriesTheConfiguredEncryptionHeader 'Aws-Kms-Key-Id = ""' -tags=integration
 
 # P2.3 step 3: the orphan precondition. A failed transfer owns no committed
 # payload, so it may delete nothing; and no operation may enumerate uploads.
-# MEASURED, not assumed: weakening EITHER conjunct alone survives this test,
-# because a failed multipart upload leaves payloadOwned AND cleanupSafe both
-# false, so the two are perfectly correlated in this scenario and no guard here
-# can tell them apart. The DeletePayload row therefore detects exactly one
-# thing -- cleanup running when nothing was committed -- and this is the mutant
-# that expresses it. The conjuncts are separated by the protocol group's
-# "unowned payload cleanup exclusion" against TestPutNeverDeletesPayloadItDidNotCreate.
-run_mutation multipart "cleanup requires something committed" blob.go 'if payloadOwned && cleanupSafe && ctx.Err() == nil {' 'if payloadOwned || cleanupSafe || ctx.Err() == nil {' TestFailedMultipartUploadIsAbortedAndLeavesNoObject 'payload deletes = ' -tags=integration
+# The guard is now one condition, so this mutant is the whole of it: cleanup
+# firing when nothing was committed.
+run_mutation multipart "cleanup requires something committed" blob.go 'if cleanupSafe && ctx.Err() == nil {' 'if cleanupSafe || ctx.Err() == nil {' TestFailedMultipartUploadIsAbortedAndLeavesNoObject 'payload deletes = ' -tags=integration
 run_mutation multipart "no upload sweep" blob.go '	accounted := newAccountedHashReader(source, s.options.maxAccountedObjectSize)' '	if listed, listErr := s.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(s.options.bucket)}); listErr == nil {
 		for _, stale := range listed.Uploads {
 			_, _ = s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(s.options.bucket), Key: stale.Key, UploadId: stale.UploadId})

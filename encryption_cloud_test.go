@@ -104,28 +104,43 @@ func TestCloudServiceReportsTheRequestedServerSideEncryption(t *testing.T) {
 				defer cleanupCancel()
 				_ = store.Delete(cleanupCtx, key)
 			})
+			// BOTH committed objects are checked, not just the manifest. The
+			// payload is the larger object and the only one the multipart path
+			// writes, so a posture applied to the small manifest PutObject and
+			// dropped on CreateMultipartUpload would pass a manifest-only check.
 			manifestKey, err := manifestObjectKey(target.prefix, key)
 			if err != nil {
 				t.Fatalf("manifestObjectKey: %v", RedactedErrorText(err))
 			}
-			head, err := store.client.HeadObject(ctx, &s3.HeadObjectInput{
-				Bucket: aws.String(target.bucket), Key: aws.String(manifestKey),
-			})
+			manifest, err := store.readManifest(ctx, manifestKey, key)
 			if err != nil {
-				t.Fatal("HeadObject on the committed manifest failed")
+				t.Fatalf("readManifest: %v", RedactedErrorText(err))
 			}
-			if testCase.want != "" {
-				if head.ServerSideEncryption != testCase.want {
-					t.Fatalf("service reported server-side encryption %q, want %q", head.ServerSideEncryption, testCase.want)
+			for _, committed := range []struct {
+				what      string
+				objectKey string
+			}{{"manifest", manifestKey}, {"payload", manifest.PayloadKey}} {
+				head, err := store.client.HeadObject(ctx, &s3.HeadObjectInput{
+					Bucket: aws.String(target.bucket), Key: aws.String(committed.objectKey),
+				})
+				if err != nil {
+					t.Fatalf("HeadObject on the committed %s failed", committed.what)
 				}
-				return
-			}
-			// The bucket-default row is a report, not a pass/fail on the
-			// service: a bucket that enforces nothing is a real deployment
-			// state, and it is exactly the state RequireConfirmedEncryption
-			// refuses to start against.
-			if head.ServerSideEncryption == "" {
-				t.Fatal("the bucket applied no default server-side encryption; a deployment requiring encryption must not use EncryptionBucketDefault against this bucket")
+				if testCase.want != "" {
+					if head.ServerSideEncryption != testCase.want {
+						t.Errorf("service reported %s server-side encryption %q, want %q", committed.what, head.ServerSideEncryption, testCase.want)
+					}
+					continue
+				}
+				// The bucket-default row fails when the bucket enforces
+				// nothing. That is a real deployment state rather than a
+				// service defect, and it is exactly the state
+				// RequireConfirmedEncryption refuses to start against -- but a
+				// run of THIS test is an assertion that the bucket does
+				// encrypt, so it is reported as a failure, not as a note.
+				if head.ServerSideEncryption == "" {
+					t.Errorf("the bucket applied no default server-side encryption to the %s; a deployment requiring encryption must not use EncryptionBucketDefault against this bucket", committed.what)
+				}
 			}
 		})
 	}
