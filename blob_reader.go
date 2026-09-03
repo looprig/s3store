@@ -74,6 +74,10 @@ var errBlobReaderClosed error = &BlobReaderClosedError{}
 // single mutex serializes everything, IS safe against concurrent Reads, so a
 // consumer that reads one blob from several goroutines will work there and
 // race here. One goroutine per reader.
+//
+// That warning is repeated on Store.Get and in the README, because this type is
+// unexported: the reader who needs it is an integrator swapping a Blobs backend
+// under sessionstore, and none of them can see a comment here.
 type blobReader struct {
 	verifier *verifyingBlobReader
 	// abort cancels the context the payload request was issued with. It is one

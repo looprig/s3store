@@ -157,6 +157,24 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 
 // Get returns a stream whose EOF is conditional on exact length and digest.
 // Its Store-wide slot remains held until the reader terminates or is closed.
+//
+// The returned reader supports bounded shutdown: Close returns within
+// BlobReaderCloseBound even with a Read blocked on the network, and after Close
+// returns every Read yields zero bytes and an error matching fs.ErrClosed,
+// never io.EOF.
+//
+// One reader, one reading goroutine. Close may be called concurrently with a
+// Read, which is what storage.BlobReaderLifecycle requires, but Read is NOT
+// safe against another Read: the verifier behind the reader keeps its offset,
+// hash, and terminal error unsynchronized. This differs from memstore, whose
+// single mutex serializes everything and so tolerates concurrent Reads, so a
+// consumer that reads one blob from several goroutines works there and races
+// here.
+//
+// The stream is bounded by this call's context. The payload request is issued
+// on a child of ctx, so a reader obtained under a short Get deadline is torn
+// down when that deadline passes; pass a context whose deadline covers the
+// read.
 func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := guard.RequireDeadline(ctx, "Blobs.Get"); err != nil {
 		return nil, err

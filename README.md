@@ -115,6 +115,15 @@ is a claim about a mechanism, not a promise about a number:
   is defence in depth on a reachable path rather than the only thing separating
   a torn-down stream from a verified record.
 
+- **One reader, one reading goroutine.** `Close` may be called concurrently with
+  a `Read` — that is what the capability requires — but **`Read` is not safe
+  against another `Read`**: the verifier behind the reader keeps its offset,
+  hash, and terminal error unsynchronized. memstore's single mutex serializes
+  everything and so tolerates concurrent `Read`s, which means a consumer that
+  reads one blob from several goroutines works against memstore and races here.
+  This is the one place swapping a Blobs backend under SessionStore can regress
+  silently, so it is stated on `Get` as well.
+
 `BlobReaderCloseBound` is a conservative constant, not a measurement. What is
 measured is the mechanism: a fixture serves a short prefix of a payload and then
 stops writing, so a real `Read` blocks on a real socket, and the test requires

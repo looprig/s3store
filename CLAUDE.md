@@ -118,6 +118,13 @@ measurement, so it may not be a local-only run. `vet`, `staticcheck`, and
 tagged file is compiled by no untagged analysis and the cloud test -- which
 executes nowhere -- would otherwise be unlinted.
 
+Do not add `go build -tags cloud` "for safety": **`go build` never compiles
+`_test.go` files under any tag**, so it covers a disjoint set and never sees
+`encryption_cloud_test.go` at all. Measured with a deliberate type error in that
+file: `go build -tags cloud` exited 0 and did not see it, while tagged `vet` and
+`staticcheck` both caught it. The tagged analysers are the whole of that
+file's protection.
+
 `scripts/mutation-test.sh` snapshots the files it mutates and restores them.
 Append new mutations BEFORE the trailing `restore_snapshot` / `rm -rf` epilogue;
 anything after it runs with no snapshot, so every restore silently becomes a
