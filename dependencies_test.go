@@ -57,8 +57,8 @@ func TestDependencyBoundary(t *testing.T) {
 	if !slices.Equal(direct, wantDirect) {
 		t.Fatalf("direct modules = %v, want %v", direct, wantDirect)
 	}
-	if versions["github.com/looprig/storage"] != "v0.6.0" {
-		t.Errorf("Storage version = %q, want v0.6.0", versions["github.com/looprig/storage"])
+	if versions["github.com/looprig/storage"] != "v0.6.1" {
+		t.Errorf("Storage version = %q, want v0.6.1", versions["github.com/looprig/storage"])
 	}
 	if versions["github.com/aws/aws-sdk-go-v2/credentials"] == "" {
 		t.Error("AWS credentials module is not pinned")

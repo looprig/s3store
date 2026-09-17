@@ -169,7 +169,7 @@ for operation in Put Get Delete List; do
 	run_mutation blob "$operation deadline call" blob.go "guard.RequireDeadline(ctx, \"Blobs.$operation\")" "guard.NotImplemented(\"Blobs.$operation\")" TestBlobOperationMethodsCallDeadlineGuard 'does not call guard.RequireDeadline'
 done
 
-run_mutation deps "replace directive" go.mod 'go 1.26.6' 'go 1.26.6
+run_mutation deps "replace directive" go.mod 'go 1.26.8' 'go 1.26.8
 
 replace example.test/absent-module v1.0.0 => example.test/absent-module v1.0.1' TestDependencyBoundary 'replace directives, want none'
 run_mutation deps "extra direct module" go.mod 'github.com/aws/smithy-go v1.28.1 // indirect' 'github.com/aws/smithy-go v1.28.1' TestDependencyBoundary 'direct modules ='
