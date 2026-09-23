@@ -14,10 +14,31 @@ is the atomic logical object: identical retries are no-ops, different bytes
 conflict, and no writer overwrites another logical value.
 
 Backend manifest keys contain a SHA-256 binding plus raw-URL encoding of the
-validated logical key. The longest supported 512-byte key under the longest
-256-byte deployment prefix produces a 1,014-byte backend key, below S3's
+validated logical key. The encoding is split into '/'-separated segments of at
+most 255 bytes, because MinIO refuses any object-key segment longer than that
+(`XMinioInvalidObjectName`); AWS S3 has no such limit. The split is a pure
+function of the encoded length and the decoder accepts only that one split, so
+the mapping stays injective. The longest supported 512-byte key under the
+longest 256-byte deployment prefix produces a 1,016-byte backend key, below S3's
 1,024-byte limit. Listing validates each row independently and pages past
 foreign or malformed keys.
+
+**Compatibility with v0.1.x.** A logical key of at most 191 bytes encodes to
+one segment, byte-identical to v0.1.x, so every object those releases wrote on
+any service is still addressed directly. A longer key was written by v0.1.x as
+one over-long segment, which only a service without a segment limit (AWS S3)
+accepted; MinIO refused it, so no such object exists there. This release still
+honours those AWS-S3 rows: `Get` falls back to the v0.1.x key, `List` decodes
+both shapes (and returns each logical key once), `Delete` removes both, and
+`Put` treats an existing v0.1.x row as the blob's value (identical bytes succeed,
+different bytes are `BlobConflictError`), so the value of a key never changes.
+A 400 answer to the v0.1.x key is read as absence, because a service that
+refuses the key could never have stored it; a 400 for a key this release writes
+remains a backend error. Costs and limits: a `Get` or `Delete` of an absent key
+over 191 bytes issues one extra HEAD, and every `Put` of such a key issues one.
+No migration is required. Do not run v0.1.x and this release as concurrent
+writers of keys over 191 bytes on AWS S3: a v0.1.x `Put` does not see the new
+encoding, so the two can publish different values for one key.
 
 ## Configuration
 
@@ -27,8 +48,32 @@ field cannot read as an accepted posture. `RequireConfirmedEncryption` states
 that the deployment policy requires server-side encryption; see below. HTTPS is mandatory except for an
 explicit loopback-only test option; a loopback host is not itself sufficient.
 Addressing style, encryption policy, multipart threshold/part size, per-transfer
-concurrency, and Store-wide concurrent transfers are validated before SDK
-construction.
+concurrency, Store-wide concurrent transfers, and the default operation timeout
+are validated before SDK construction.
+
+### Default operation timeout
+
+The Storage contract does not require a caller to put a deadline on its
+context, and SessionStore's consumers do not (Host opens its store on
+`context.WithoutCancel`). v0.1.x refused every such call with
+`DeadlineRequiredError`. This release bounds it instead: `Open`, `Put`, `Get`,
+`Delete` and `List` run under `Options.DefaultOperationTimeout` (default
+`DefaultOperationTimeout`, 30s) when the context has no deadline.
+
+- A caller's own deadline always wins, whether shorter or longer than the
+  default. The default only fills an absent deadline.
+- The default is a child of the caller's context, so cancelling that context
+  still ends the call.
+- For `Get`, the default also bounds the returned stream, exactly as a caller
+  deadline does (see below). It is released when the stream reaches a terminal
+  result or is closed. A deadline-free `Get` of a body that takes longer than
+  the default to read will be torn down; raise the option or pass a deadline.
+- A nil context is still refused with `DeadlineRequiredError`.
+
+The reason v0.1.x required a deadline still holds, and the default satisfies it:
+an unanswered request, a stalled response body, or a saturated transfer gate
+must not wait forever. The SDK's bounded retries all run inside the same
+deadline.
 
 ### The 512 MiB transfer-memory bound is a configuration-time bound
 
@@ -133,9 +178,9 @@ the constant is a declared ceiling on teardown rather than a latency guarantee
 against a remote endpoint or a wedged middlebox.
 
 One caller-visible consequence of how the stream is scoped: the payload request
-is issued on a child of the context passed to `Get`, and every operation here
-requires a caller deadline, so **the returned stream is bounded by the `Get`
-call's deadline, not by a separate stream deadline**. A caller that obtains a
+is issued on a child of the context passed to `Get`, so **the returned stream
+is bounded by the `Get` call's deadline (or, when it has none, by the default
+operation timeout), not by a separate stream deadline**. A caller that obtains a
 reader under a short `Get` deadline and then streams past it will see the
 payload torn down. Pass `Get` a context whose deadline covers the read.
 

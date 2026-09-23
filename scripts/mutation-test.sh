@@ -137,7 +137,7 @@ run_mutation options "aggregate memory ceiling" options.go 'if perTransferMemory
 run_mutation memory "additive transfer memory" options.go 'perTransferMemory := threshold + partBuffers' 'perTransferMemory := max(threshold, partBuffers)' TestOptionsResolve 'additive_aggregate_memory_budget'
 
 run_mutation open "Open option short circuit" s3store.go 'if err != nil {' 'if false && err != nil {' TestOpenRejectsOptionsBeforeSDKConstruction 'want nil, error'
-run_mutation open "Open deadline" s3store.go 'guard.RequireDeadline(ctx, "Open")' 'guard.NotImplemented("Open")' TestOpenRequiresDeadline 'want *DeadlineRequiredError'
+run_mutation open "Open default bound" s3store.go 'ctx, cancel, err := guard.Bound(ctx, "Open", resolved.operationTimeout)' 'ctx, cancel, err := ctx, context.CancelFunc(func() {}), error(nil)' TestOpenWithoutDeadlineAppliesTheDefaultBound 'ran its SDK loader on an unbounded context'
 run_mutation open "SDK loader failure" s3store.go 'awsConfig, err := loadConfig(ctx, resolved)
 	if err != nil {' 'awsConfig, err := loadConfig(ctx, resolved)
 	if false && err != nil {' TestOpenRedactsEverySDKLoaderFailure 'Open returned Store with SDK loader error'
@@ -159,14 +159,22 @@ run_mutation security "endpoint userinfo redaction" options.go 'invalidOption("E
 run_mutation security "presigned query redaction" options.go 'invalidOption("Endpoint", "must not contain a query")' 'invalidOption("Endpoint", "must not contain a query: "+raw)' TestOptionsResolve 'error disclosed credential material "super-secret"'
 run_mutation security "KMS identifier redaction" options.go 'invalidOption("KMSKeyID", "may be set only when EncryptionKMS is selected")' 'invalidOption("KMSKeyID", "may be set only when EncryptionKMS is selected: "+keyID)' TestOptionsResolve 'error disclosed credential material "secret-key"'
 
-run_mutation blob "nil context" internal/guard/guard.go 'if ctx == nil {' 'if false && ctx == nil {' TestBlobOperationsRejectNilContext 'panic:'
-run_mutation blob "context deadline" internal/guard/guard.go 'if _, ok := ctx.Deadline(); !ok {' 'if _, ok := ctx.Deadline(); ok && false {' TestOpenRequiresDeadline 'Open returned a Store without a caller deadline'
+run_mutation blob "nil context" internal/guard/guard.go '	if ctx == nil {
+		return nil, nil, &DeadlineRequiredError{Operation: operation}' '	if false && ctx == nil {
+		return nil, nil, &DeadlineRequiredError{Operation: operation}' TestBlobOperationsRejectNilContext 'panic:'
+run_mutation blob "context deadline" internal/guard/guard.go 'if _, ok := ctx.Deadline(); !ok {' 'if _, ok := ctx.Deadline(); ok && false {' TestAcquireTransferRequiresDeadline 'want *DeadlineRequiredError'
+run_mutation blob "caller deadline wins" internal/guard/guard.go '	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}, nil
+	}' '' TestCallerDeadlineWinsOverTheDefault 'overrode the caller'
+run_mutation blob "default bound applied" internal/guard/guard.go 'bounded, cancel := context.WithTimeout(ctx, timeout)' 'bounded, cancel := context.WithCancel(ctx)' TestHungBackendReturnsWithinTheDefaultBound 'want context.DeadlineExceeded'
+run_mutation options "default operation timeout" options.go '		operationTimeout = DefaultOperationTimeout' '		operationTimeout = time.Hour' TestDefaultOperationTimeoutOption 'zero DefaultOperationTimeout resolves to'
+run_mutation options "operation timeout minimum" options.go 'if operationTimeout < minOperationTimeout {' 'if false && operationTimeout < minOperationTimeout {' TestDefaultOperationTimeoutOption 'want *OptionsError for the field'
 run_mutation blob "blob key validation" key.go 'return storage.ValidateName(key)' 'return nil' TestBlobOperationsValidateKeysBeforeStubResult 'InvalidNameError.Name ='
 run_mutation blob "empty list prefix" key.go 'if prefix == "" {' 'if false && prefix == "" {' TestListPrefixValidation 'validateListPrefix("")'
 run_mutation blob "list trailing slash" key.go 'strings.TrimSuffix(prefix, "/")' 'strings.TrimSuffix(prefix, "\\x00")' TestListPrefixValidation 'validateListPrefix("blobs/")'
 
 for operation in Put Get Delete List; do
-	run_mutation blob "$operation deadline call" blob.go "guard.RequireDeadline(ctx, \"Blobs.$operation\")" "guard.NotImplemented(\"Blobs.$operation\")" TestBlobOperationMethodsCallDeadlineGuard 'does not call guard.RequireDeadline'
+	run_mutation blob "$operation default bound" blob.go "guard.Bound(ctx, \"Blobs.$operation\", s.options.operationTimeout)" "guard.Bound(ctx, \"Blobs.$operation\", 1<<62)" TestHungBackendReturnsWithinTheDefaultBound "$operation did not return within"
 done
 
 run_mutation deps "replace directive" go.mod 'go 1.26.8' 'go 1.26.8
@@ -496,6 +504,20 @@ run_mutation lifecycle "transfer slot released once" blob_reader.go '	r.releaseO
 run_mutation lifecycle "closed error recording classification" redact.go '	var readerClosed *BlobReaderClosedError
 	if errors.As(err, &readerClosed) {' '	var readerClosed *BlobReaderClosedError
 	if false && errors.As(err, &readerClosed) {' TestBlobReaderClosedErrorIsRecordable 'want the typed classification'
+
+# D1: bounded manifest-key segments and v0.1.1 compatibility.
+run_mutation keys "segment limit" key.go 'const maxObjectKeySegmentBytes = 255' 'const maxObjectKeySegmentBytes = 256' TestManifestKeySegmentsFitMinIO 'exceeds 255'
+run_mutation keys "canonical split only" key.go 'if len(encodedParts) > 1 && segmentEncoding(encoded) != strings.Join(encodedParts, "/") {' 'if false && len(encodedParts) > 1 && segmentEncoding(encoded) != strings.Join(encodedParts, "/") {' TestManifestKeyDecodingIsCanonical 'want refusal'
+run_mutation keys "legacy only above one segment" key.go 'if len(encoded) <= maxObjectKeySegmentBytes {' 'if false && len(encoded) <= maxObjectKeySegmentBytes {' TestManifestKeyShortFormIsTheV011Encoding 'reports a distinct legacy encoding'
+run_mutation keys "legacy candidate consulted" blob.go 'return []string{current, legacy}, nil' '_ = legacy
+		return []string{current}, nil' TestV011LongKeyRowStaysReadableAndImmutable 'Get(' -tags=integration
+run_mutation keys "legacy row decides Put" blob.go 'if settled, err := s.settleAgainstLegacyManifest(ctx, key, manifest); settled || err != nil {' 'if settled, err := false, error(nil); settled || err != nil {' TestV011LongKeyRowStaysReadableAndImmutable 'published a second manifest' -tags=integration
+run_mutation keys "legacy 400 is absence" blob.go '(legacy && isHTTPStatus(err, 400))' '(false && isHTTPStatus(err, 400))' TestLongLogicalKeyOnASegmentLimitedService 'Put:' -tags=integration
+run_mutation keys "400 is absence only for legacy" blob.go '(legacy && isHTTPStatus(err, 400))' 'isHTTPStatus(err, 400)' TestManifestHeadBadRequestIsNotAbsence 'want *BackendError' -tags=integration
+
+# D2: the default bound covers Get's stream until it ends, and no longer.
+run_mutation d2 "Get stream keeps its bound" blob.go '	handedOff = true' '	handedOff = false' TestDeadlineFreeCallsSucceed 'ReadAll' -tags=integration
+run_mutation d2 "Get stream is bounded" blob.go 'readCtx, abortRead := context.WithCancel(ctx)' 'readCtx, abortRead := context.WithCancel(context.WithoutCancel(ctx))' TestDeadlineFreeStreamIsBoundedByTheDefault 'outlived the default bound' -tags=integration
 
 restore_snapshot
 rm -rf "$snapshot_dir"

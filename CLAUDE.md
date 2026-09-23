@@ -73,7 +73,14 @@ error only.
   object keys bind a reversible encoding to the logical key's SHA-256. Payloads
   are uniquely staged, range-verified, and published only through a conditional
   manifest create.
-- Every operation, including `Open`, requires a caller context deadline.
+- Every operation, including `Open`, runs under a deadline: the caller's if it
+  has one (always, even when longer), else `Options.DefaultOperationTimeout`
+  (30s default) applied by `guard.Bound` as a child of the caller's context.
+  The Storage contract does not require callers to supply one, so refusing an
+  undated context (v0.1.x) is not an option. `Get`'s default bound is released
+  only when the stream terminates or closes, never when `Get` returns.
+  `TestBlobOperationMethodsCallDeadlineGuard` requires every operation to call
+  `guard.Bound`; the hung-endpoint tests hold the bound itself.
 - `Open` performs no S3 request. Blob methods use the bounded standard SDK retry
   classifier; source reads are never retried, while materialized upload parts
   are replayable.
@@ -96,6 +103,12 @@ error only.
   assertion kill.
 - The stream is bounded by the `Get` call's deadline, because the payload
   request is a child of that context. There is no separate stream deadline.
+- Manifest keys split the encoded logical key into segments of at most 255
+  bytes (MinIO's per-segment limit). Keys of at most 191 bytes encode exactly
+  as v0.1.x did. Longer keys may have a v0.1.x single-segment row on AWS S3:
+  `Get`/`Delete` consult it, `List` decodes it, and `Put` treats it as the
+  existing value. A 400 is absence ONLY for that legacy key. Do not drop this
+  fallback without a migration story.
 - Over a real HTTP body most of those parts mask each other -- abort and body
   Close each unblock a stalled read alone, net/http Close is idempotent, and
   the two closed checks are interchangeable after Close returns. They are held
@@ -105,7 +118,10 @@ error only.
 ## Testing and build
 
 Unit tests require no endpoint. Integration-tagged tests start the disposable
-in-process S3 fixture. `cloud`-tagged tests contact a service this repository
+in-process S3 fixture. `make test-minio` (`scripts/minio-test.sh`) starts a
+disposable local MinIO pinned by digest with Docker, runs the
+`integration && minio` tests, and removes the container; it is the only proof of
+the 255-byte segment limit, which the fixture only emulates. `cloud`-tagged tests contact a service this repository
 does not start and are excluded from both paths; never run them against a real
 account without explicit human approval. Every Go command uses `GOWORK=off`,
 and tests always run with `-race`.
