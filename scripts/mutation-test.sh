@@ -519,6 +519,40 @@ run_mutation keys "400 is absence only for legacy" blob.go '(legacy && isHTTPSta
 run_mutation d2 "Get stream keeps its bound" blob.go '	handedOff = true' '	handedOff = false' TestDeadlineFreeCallsSucceed 'ReadAll' -tags=integration
 run_mutation d2 "Get stream is bounded" blob.go 'readCtx, abortRead := context.WithCancel(ctx)' 'readCtx, abortRead := context.WithCancel(context.WithoutCancel(ctx))' TestDeadlineFreeStreamIsBoundedByTheDefault 'outlived the default bound' -tags=integration
 
+# D2: every default bound is released (cancelled) when its operation or stream
+# ends. A leaked bound only fires at its timer, so these are leak-class
+# mutants that only the opaque-parent goroutine count can see.
+run_mutation d2 "Get stream end releases bound" blob.go '		s.releaseTransfer()
+		cancelBound()' '		s.releaseTransfer()' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released' -tags=integration
+run_mutation d2 "Get stream releases bound on neither path" blob.go '	abort := func() {
+		abortRead()
+		cancelBound()
+	}
+	releaseStream := func() {
+		s.releaseTransfer()
+		cancelBound()
+	}' '	abort := func() {
+		abortRead()
+	}
+	releaseStream := func() {
+		s.releaseTransfer()
+	}' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released' -tags=integration
+for operation in Put Delete List; do
+	case $operation in
+		List) ret='nil, err' ;;
+		*) ret='err' ;;
+	esac
+	run_mutation d2 "$operation releases bound" blob.go "	ctx, cancel, err := guard.Bound(ctx, \"Blobs.$operation\", s.options.operationTimeout)
+	if err != nil {
+		return $ret
+	}
+	defer cancel()" "	ctx, cancel, err := guard.Bound(ctx, \"Blobs.$operation\", s.options.operationTimeout)
+	if err != nil {
+		return $ret
+	}
+	_ = cancel" TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released' -tags=integration
+done
+
 restore_snapshot
 rm -rf "$snapshot_dir"
 trap - EXIT HUP INT TERM
