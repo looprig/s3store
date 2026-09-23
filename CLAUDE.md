@@ -108,7 +108,10 @@ error only.
   as v0.1.x did. Longer keys may have a v0.1.x single-segment row on AWS S3:
   `Get`/`Delete` consult it, `List` decodes it, and `Put` treats it as the
   existing value. A 400 is absence ONLY for that legacy key. Do not drop this
-  fallback without a migration story.
+  fallback without a migration story. The upgrade is ONE-WAY on AWS S3 for
+  keys over 191 bytes: v0.1.x does not see rows v0.2.0 writes (Get not found,
+  List omits), so never roll back below v0.2.0 after such writes, and no v0.1.x
+  instance may read or write long keys during a rolling upgrade.
 - Over a real HTTP body most of those parts mask each other -- abort and body
   Close each unblock a stalled read alone, net/http Close is idempotent, and
   the two closed checks are interchangeable after Close returns. They are held

@@ -34,11 +34,27 @@ both shapes (and returns each logical key once), `Delete` removes both, and
 different bytes are `BlobConflictError`), so the value of a key never changes.
 A 400 answer to the v0.1.x key is read as absence, because a service that
 refuses the key could never have stored it; a 400 for a key this release writes
-remains a backend error. Costs and limits: a `Get` or `Delete` of an absent key
-over 191 bytes issues one extra HEAD, and every `Put` of such a key issues one.
-No migration is required. Do not run v0.1.x and this release as concurrent
-writers of keys over 191 bytes on AWS S3: a v0.1.x `Put` does not see the new
-encoding, so the two can publish different values for one key.
+remains a backend error. One residual risk on AWS S3: an existing object can also
+answer HEAD 400 (for example when STS credentials expire between two requests of
+one `Put`), and if that happens on the legacy lookup of a key that holds a
+v0.1.x row with *different* bytes, the `Put` publishes a new-format row that
+shadows it. It needs a pre-existing v0.1.x long-key row, different bytes, and
+that timing. Costs and limits: a `Get` or `Delete` of an absent key over 191
+bytes issues one extra HEAD, and every `Put` of such a key issues one. No
+migration is required.
+
+**The upgrade is ONE-WAY on AWS S3 for keys over 191 bytes.** v0.1.x cannot see
+a row this release writes for such a key: a v0.1.x `Get` answers not found and a
+v0.1.x `List` silently omits it, and a v0.1.x `Put` can then publish a second,
+different value under the old key. Therefore:
+
+- never roll back below v0.2.0 once any key over 191 bytes has been written;
+- during a rolling upgrade, no v0.1.x instance may read or write keys over 191
+  bytes: finish the rollout first.
+
+On MinIO a v0.1.x instance fails loudly on such keys (HEAD 400 surfaces as
+`BackendError`), as it always did. Keys of at most 191 bytes are unaffected in
+both directions.
 
 ## Configuration
 
@@ -64,10 +80,16 @@ context, and SessionStore's consumers do not (Host opens its store on
   default. The default only fills an absent deadline.
 - The default is a child of the caller's context, so cancelling that context
   still ends the call.
+- A deadline-free `Put` is bounded end to end by the default: upload of every
+  part of a multipart body, verification, and manifest publication together.
+  A large body that cannot be uploaded within it fails; raise the option or
+  pass a deadline.
 - For `Get`, the default also bounds the returned stream, exactly as a caller
   deadline does (see below). It is released when the stream reaches a terminal
   result or is closed. A deadline-free `Get` of a body that takes longer than
   the default to read will be torn down; raise the option or pass a deadline.
+- Every bound is cancelled as soon as its operation (or `Get`'s stream) ends,
+  witnessed by `TestDefaultBoundIsReleasedAfterEveryOperation`.
 - A nil context is still refused with `DeadlineRequiredError`.
 
 The reason v0.1.x required a deadline still holds, and the default satisfies it:
