@@ -24,9 +24,9 @@ func TestBlobOperationMethodsCallDeadlineGuard(t *testing.T) {
 			continue
 		}
 		operations++
-		if !callsGuard(function.Body, "RequireDeadline") {
+		if !callsGuard(function.Body, "Bound") {
 			position := fileSet.Position(function.Pos())
-			t.Errorf("blob.go:%d %s does not call guard.RequireDeadline", position.Line, function.Name.Name)
+			t.Errorf("blob.go:%d %s does not call guard.Bound", position.Line, function.Name.Name)
 		}
 	}
 	if operations != 4 {

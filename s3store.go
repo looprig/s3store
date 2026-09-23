@@ -30,16 +30,19 @@ type configLoader func(context.Context, resolvedOptions) (aws.Config, error)
 
 var loadConfig configLoader = defaultLoadConfig
 
-// Open validates configuration, requires a caller deadline, and constructs
-// lazy SDK clients. It performs no request, bucket probe, or mutation.
+// Open validates configuration and constructs lazy SDK clients. It performs no
+// request, bucket probe, or mutation. A context without a deadline is bounded
+// by Options.DefaultOperationTimeout.
 func Open(ctx context.Context, options Options) (*Store, error) {
 	resolved, err := options.resolve()
 	if err != nil {
 		return nil, err
 	}
-	if err := guard.RequireDeadline(ctx, "Open"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Open", resolved.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	awsConfig, err := loadConfig(ctx, resolved)
 	if err != nil {
 		// SDK configuration errors can contain provider details. Do not wrap,

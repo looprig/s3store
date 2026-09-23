@@ -40,9 +40,11 @@ func (e *BackendError) Error() string {
 // Put stages a uniquely-owned payload, hashes it during upload, verifies the
 // committed bytes, then atomically publishes the logical manifest.
 func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
-	if err := guard.RequireDeadline(ctx, "Blobs.Put"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Blobs.Put", s.options.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	if err := validateBlobKey(key); err != nil {
 		return err
 	}
@@ -176,9 +178,18 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 // down when that deadline passes; pass a context whose deadline covers the
 // read.
 func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if err := guard.RequireDeadline(ctx, "Blobs.Get"); err != nil {
+	// A default bound covers the returned stream too, so it is released only
+	// when the reader terminates or closes, never when Get returns.
+	ctx, cancelBound, err := guard.Bound(ctx, "Blobs.Get", s.options.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			cancelBound()
+		}
+	}()
 	if err := validateBlobKey(key); err != nil {
 		return nil, err
 	}
@@ -227,15 +238,26 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	}
 	verifier := newVerifyingBlobReader(output.Body, manifest.Size, manifest.Digest)
 	release = false
-	return newBlobReader(verifier, abortRead, s.releaseTransfer), nil
+	handedOff = true
+	abort := func() {
+		abortRead()
+		cancelBound()
+	}
+	releaseStream := func() {
+		s.releaseTransfer()
+		cancelBound()
+	}
+	return newBlobReader(verifier, abort, releaseStream), nil
 }
 
 // Delete removes the logical manifest first. Payload cleanup cannot make the
 // deleted key present again, so an unreachable payload is not a logical error.
 func (s *Store) Delete(ctx context.Context, key string) error {
-	if err := guard.RequireDeadline(ctx, "Blobs.Delete"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Blobs.Delete", s.options.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	if err := validateBlobKey(key); err != nil {
 		return err
 	}
@@ -271,9 +293,11 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // List validates each manifest row independently so one undecodable object
 // cannot disable the rest of a tenant's page.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
-	if err := guard.RequireDeadline(ctx, "Blobs.List"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Blobs.List", s.options.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	if err := validateListPrefix(prefix); err != nil {
 		return nil, err
 	}

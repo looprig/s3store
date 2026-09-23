@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -24,12 +25,17 @@ const (
 	maxConcurrentTransfers              = 32
 	maxAggregateTransferMemory    int64 = 512 << 20
 	maxKMSKeyIDBytes                    = 2048
+	minOperationTimeout                 = time.Millisecond
 	// maxUploadParts is the transfer manager's hard ceiling on parts per
 	// upload; it rejects any value above it. It is pinned here rather than
 	// inherited so the accounted part size below is derived from a value this
 	// module chose.
 	maxUploadParts int64 = 10000
 )
+
+// DefaultOperationTimeout bounds an operation whose context carries no
+// deadline, when Options.DefaultOperationTimeout is zero.
+const DefaultOperationTimeout = 30 * time.Second
 
 // AddressingStyle selects how bucket names are placed into S3 requests.
 type AddressingStyle uint8
@@ -89,6 +95,15 @@ type Options struct {
 	// credential chain. Raw access-key and secret-key fields are intentionally absent.
 	Credentials aws.CredentialsProvider
 
+	// DefaultOperationTimeout bounds every call (Open, Put, Get and its
+	// returned stream, Delete, List) whose context has no deadline. The
+	// Storage contract does not require callers to supply one, so the Store
+	// supplies it: an unanswered request must not hang forever. A caller's
+	// own deadline always wins, shorter or longer, and cancellation of the
+	// caller's context is honoured either way. Zero selects the 30s
+	// DefaultOperationTimeout; a negative or sub-millisecond value is rejected.
+	DefaultOperationTimeout time.Duration
+
 	// AllowInsecureLocalhostOnly permits HTTP solely for an explicitly selected
 	// loopback test endpoint. Production and remote endpoints require HTTPS.
 	AllowInsecureLocalhostOnly bool
@@ -123,6 +138,7 @@ type resolvedOptions struct {
 	concurrency            int
 	maxConcurrentTransfers int
 	credentials            aws.CredentialsProvider
+	operationTimeout       time.Duration
 }
 
 func (o Options) resolve() (resolvedOptions, error) {
@@ -198,6 +214,13 @@ func (o Options) resolve() (resolvedOptions, error) {
 	if maxTransfers > maxConcurrentTransfers {
 		return resolvedOptions{}, invalidOption("MaxConcurrentTransfers", "must be at most 32")
 	}
+	operationTimeout := o.DefaultOperationTimeout
+	if operationTimeout == 0 {
+		operationTimeout = DefaultOperationTimeout
+	}
+	if operationTimeout < minOperationTimeout {
+		return resolvedOptions{}, invalidOption("DefaultOperationTimeout", "must be at least one millisecond or zero for the default")
+	}
 	partBuffers := int64(concurrency+1) * partSize
 	perTransferMemory := threshold + partBuffers
 	if perTransferMemory*int64(maxTransfers) > maxAggregateTransferMemory {
@@ -211,7 +234,7 @@ func (o Options) resolve() (resolvedOptions, error) {
 		multipartThreshold: threshold, multipartPartSize: partSize,
 		maxAccountedObjectSize: accountedObjectSize(partSize),
 		concurrency:            concurrency, maxConcurrentTransfers: maxTransfers,
-		credentials: o.Credentials,
+		credentials: o.Credentials, operationTimeout: operationTimeout,
 	}, nil
 }
 

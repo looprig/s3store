@@ -1,7 +1,6 @@
 package s3store
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -64,8 +63,7 @@ func TestRedactedErrorTextClassifiesPackageErrors(t *testing.T) {
 	if got := RedactedErrorText(optionsErr); got != optionsErr.Error() || strings.Contains(got, "super-secret") {
 		t.Errorf("OptionsError text = %q, want the already-redacted %q", got, optionsErr.Error())
 	}
-	store := newScaffoldStore()
-	if got := RedactedErrorText(store.Put(context.TODO(), "blobs/key", nil)); !strings.Contains(got, "Blobs.Put") {
+	if got := RedactedErrorText(&DeadlineRequiredError{Operation: "Blobs.Put"}); !strings.Contains(got, "Blobs.Put") {
 		t.Errorf("DeadlineRequiredError text = %q, want the operation name", got)
 	}
 	if got := RedactedErrorText(&NotImplementedError{Operation: "Blobs.Get"}); !strings.Contains(got, "Blobs.Get") {

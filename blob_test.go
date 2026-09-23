@@ -15,14 +15,65 @@ import (
 	"github.com/looprig/storage"
 )
 
-func TestOpenRequiresDeadline(t *testing.T) {
-	store, err := Open(context.Background(), validOptions())
-	if store != nil {
-		t.Fatal("Open returned a Store without a caller deadline")
+// TestOpenWithoutDeadlineAppliesTheDefaultBound holds D2: the Storage contract
+// does not require a caller deadline, so Open supplies the configured default
+// instead of refusing, and a caller's own deadline always wins.
+func TestOpenWithoutDeadlineAppliesTheDefaultBound(t *testing.T) {
+	var observed time.Time
+	var hadDeadline bool
+	original := loadConfig
+	loadConfig = func(ctx context.Context, options resolvedOptions) (aws.Config, error) {
+		observed, hadDeadline = ctx.Deadline()
+		return aws.Config{Region: options.region, Credentials: aws.NewCredentialsCache(signableCredentials{})}, nil
 	}
-	var deadlineErr *DeadlineRequiredError
-	if !errors.As(err, &deadlineErr) {
-		t.Fatalf("Open error = %T %v, want *DeadlineRequiredError", err, err)
+	t.Cleanup(func() { loadConfig = original })
+
+	options := validOptions()
+	options.DefaultOperationTimeout = 7 * time.Second
+	started := time.Now()
+	store, err := Open(context.Background(), options)
+	if err != nil || store == nil {
+		t.Fatalf("Open without a deadline = (%v, %v), want a Store", store, err)
+	}
+	if !hadDeadline {
+		t.Fatal("Open ran its SDK loader on an unbounded context")
+	}
+	if remaining := observed.Sub(started); remaining < 6*time.Second || remaining > 8*time.Second {
+		t.Fatalf("default bound = %v, want about 7s", remaining)
+	}
+
+	// A caller deadline LONGER than the default still wins: the default only
+	// fills an absent deadline and never shortens a caller's.
+	callerDeadline := time.Now().Add(time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+	if _, err := Open(ctx, options); err != nil {
+		t.Fatalf("Open with a caller deadline: %v", err)
+	}
+	if !observed.Equal(callerDeadline) {
+		t.Fatalf("loader deadline = %v, want the caller's %v", observed, callerDeadline)
+	}
+}
+
+func TestDefaultOperationTimeoutOption(t *testing.T) {
+	resolved, err := validOptions().resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.operationTimeout != DefaultOperationTimeout {
+		t.Fatalf("zero DefaultOperationTimeout resolves to %v, want %v", resolved.operationTimeout, DefaultOperationTimeout)
+	}
+	if DefaultOperationTimeout != 30*time.Second {
+		t.Fatalf("DefaultOperationTimeout = %v, want the documented 30s", DefaultOperationTimeout)
+	}
+	for _, bad := range []time.Duration{-time.Second, time.Microsecond} {
+		options := validOptions()
+		options.DefaultOperationTimeout = bad
+		_, err := options.resolve()
+		var optionsErr *OptionsError
+		if !errors.As(err, &optionsErr) || optionsErr.Field != "DefaultOperationTimeout" {
+			t.Errorf("DefaultOperationTimeout %v error = %T %v, want *OptionsError for the field", bad, err, err)
+		}
 	}
 }
 
@@ -224,7 +275,7 @@ func TestOpenWiresBlobScaffoldWithoutNetworkIO(t *testing.T) {
 	}
 }
 
-func TestBlobOperationsRequireDeadlineBeforeStubResult(t *testing.T) {
+func TestBlobOperationsRejectNilContext(t *testing.T) {
 	store := newScaffoldStore()
 	operations := []struct {
 		name string
@@ -237,7 +288,7 @@ func TestBlobOperationsRequireDeadlineBeforeStubResult(t *testing.T) {
 	}
 	for _, operation := range operations {
 		t.Run(operation.name, func(t *testing.T) {
-			err := operation.call(context.Background())
+			err := operation.call(nil)
 			var deadlineErr *DeadlineRequiredError
 			if !errors.As(err, &deadlineErr) {
 				t.Fatalf("%s error = %T %v, want *DeadlineRequiredError", operation.name, err, err)
@@ -246,16 +297,6 @@ func TestBlobOperationsRequireDeadlineBeforeStubResult(t *testing.T) {
 				t.Errorf("operation = %q, want %q", deadlineErr.Operation, "Blobs."+operation.name)
 			}
 		})
-	}
-}
-
-func TestBlobOperationsRejectNilContext(t *testing.T) {
-	store := newScaffoldStore()
-	//lint:ignore SA1012 This test exercises the public nil-context rejection guard.
-	err := store.Put(nil, "blobs/key", bytes.NewReader(nil))
-	var deadlineErr *DeadlineRequiredError
-	if !errors.As(err, &deadlineErr) {
-		t.Fatalf("Put error = %T %v, want *DeadlineRequiredError", err, err)
 	}
 }
 
