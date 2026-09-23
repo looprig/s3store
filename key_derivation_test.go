@@ -24,7 +24,10 @@ func TestBackendManifestKeyIsCanonicalAndReversible(t *testing.T) {
 		t.Fatalf("backend key length = %d, want at most %d", len(backend), maxS3ObjectKeyBytes)
 	}
 	wantDigest := sha256.Sum256([]byte(key))
-	wantSuffix := hex.EncodeToString(wantDigest[:]) + "/" + base64.RawURLEncoding.EncodeToString([]byte(key))
+	// A 512-byte key encodes to 683 characters: two full 255-byte segments
+	// and a 173-byte tail, so no segment trips MinIO's per-segment limit.
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(key))
+	wantSuffix := hex.EncodeToString(wantDigest[:]) + "/" + encoded[:255] + "/" + encoded[255:510] + "/" + encoded[510:]
 	if !strings.HasPrefix(backend, prefix+"/blobs/v1/") || !strings.HasSuffix(backend, wantSuffix) {
 		t.Fatalf("backend key = %q, want versioned prefix and hash/encoding suffix %q", backend, wantSuffix)
 	}

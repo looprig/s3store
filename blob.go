@@ -119,6 +119,13 @@ func (s *Store) Put(ctx context.Context, key string, source io.Reader) error {
 	if err != nil {
 		return err
 	}
+	// A logical key above 191 bytes may already hold a v0.1.1 row under that
+	// release's single-segment key. Blobs are immutable, so that row decides
+	// the outcome exactly as a manifest under the current key would; this
+	// Put's staged payload is unreferenced either way, so cleanup stays safe.
+	if settled, err := s.settleAgainstLegacyManifest(ctx, key, manifest); settled || err != nil {
+		return err
+	}
 	// Once publication starts, an error can mean that S3 committed the
 	// manifest but its acknowledgement was lost. Preserve this payload until a
 	// successful read proves that the manifest points somewhere else.
@@ -202,11 +209,7 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 			s.releaseTransfer()
 		}
 	}()
-	manifestKey, err := manifestObjectKey(s.options.deploymentPrefix, key)
-	if err != nil {
-		return nil, err
-	}
-	manifest, err := s.readManifest(ctx, manifestKey, key)
+	_, manifest, err := s.locateManifest(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -265,29 +268,96 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	defer s.releaseTransfer()
-	manifestKey, err := manifestObjectKey(s.options.deploymentPrefix, key)
+	candidates, err := manifestCandidates(s.options.deploymentPrefix, key)
 	if err != nil {
 		return err
 	}
-	manifest, err := s.readManifest(ctx, manifestKey, key)
+	// Both encodings are removed: a key above 191 bytes can hold a v0.1.1 row,
+	// and deleting only the current one would let the old value reappear.
+	for index, manifestKey := range candidates {
+		manifest, err := s.readManifestAt(ctx, manifestKey, key, index > 0)
+		if err != nil {
+			var notFound *storage.BlobNotFoundError
+			if errors.As(err, &notFound) {
+				continue
+			}
+			return err
+		}
+		_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(s.options.bucket), Key: aws.String(manifestKey),
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return &BackendError{Operation: "manifest delete"}
+		}
+		s.deletePayloadBestEffort(ctx, manifest.PayloadKey)
+	}
+	return nil
+}
+
+// manifestCandidates lists every backend key a logical key's manifest may
+// live under: the current encoding first, then (index 1, when it differs)
+// v0.1.1's legacy encoding.
+func manifestCandidates(deploymentPrefix, key string) ([]string, error) {
+	current, err := manifestObjectKey(deploymentPrefix, key)
+	if err != nil {
+		return nil, err
+	}
+	if legacy, differs := legacyManifestObjectKey(deploymentPrefix, key); differs {
+		return []string{current, legacy}, nil
+	}
+	return []string{current}, nil
+}
+
+// locateManifest reads a logical key's manifest under the current encoding,
+// then under v0.1.1's encoding when that differs. Absent from both is
+// *storage.BlobNotFoundError.
+func (s *Store) locateManifest(ctx context.Context, key string) (string, blobManifest, error) {
+	candidates, err := manifestCandidates(s.options.deploymentPrefix, key)
+	if err != nil {
+		return "", blobManifest{}, err
+	}
+	var lastErr error
+	for index, manifestKey := range candidates {
+		manifest, err := s.readManifestAt(ctx, manifestKey, key, index > 0)
+		if err == nil {
+			return manifestKey, manifest, nil
+		}
+		var notFound *storage.BlobNotFoundError
+		if !errors.As(err, &notFound) {
+			return "", blobManifest{}, err
+		}
+		lastErr = err
+	}
+	return "", blobManifest{}, lastErr
+}
+
+// settleAgainstLegacyManifest decides a Put by an existing v0.1.1 row, if the
+// key can have one. settled reports that the row exists and err is the Put's
+// outcome (nil for identical content, a conflict otherwise).
+//
+// A v0.1.1 writer running concurrently with this release could still create
+// such a row after this check; mixed-version writers are not supported for
+// keys above 191 bytes, and on MinIO v0.1.1 cannot write them at all.
+func (s *Store) settleAgainstLegacyManifest(ctx context.Context, key string, manifest blobManifest) (bool, error) {
+	legacyKey, differs := legacyManifestObjectKey(s.options.deploymentPrefix, key)
+	if !differs {
+		return false, nil
+	}
+	existing, err := s.readLegacyManifest(ctx, legacyKey, key)
 	if err != nil {
 		var notFound *storage.BlobNotFoundError
 		if errors.As(err, &notFound) {
-			return nil
+			return false, nil
 		}
-		return err
+		return true, err
 	}
-	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(s.options.bucket), Key: aws.String(manifestKey),
-	})
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return &BackendError{Operation: "manifest delete"}
+	if manifestsMatch(existing, manifest) {
+		return true, nil
 	}
-	s.deletePayloadBestEffort(ctx, manifest.PayloadKey)
-	return nil
+	return true, &storage.BlobConflictError{Key: key}
 }
 
 // List validates each manifest row independently so one undecodable object
@@ -360,11 +430,23 @@ func (s *Store) publishManifest(ctx context.Context, key string, encoded []byte)
 }
 
 func (s *Store) readManifest(ctx context.Context, objectKey, logicalKey string) (blobManifest, error) {
+	return s.readManifestAt(ctx, objectKey, logicalKey, false)
+}
+
+// readLegacyManifest reads v0.1.1's single-segment row. A service that limits
+// segment length (MinIO) answers that key 400 rather than 404; such a service
+// could never have stored the row, so the refusal proves it absent. A 400 is
+// read that way ONLY for this key, never for one this release writes.
+func (s *Store) readLegacyManifest(ctx context.Context, objectKey, logicalKey string) (blobManifest, error) {
+	return s.readManifestAt(ctx, objectKey, logicalKey, true)
+}
+
+func (s *Store) readManifestAt(ctx context.Context, objectKey, logicalKey string, legacy bool) (blobManifest, error) {
 	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.options.bucket), Key: aws.String(objectKey),
 	})
 	if err != nil {
-		if isHTTPStatus(err, 404) {
+		if isHTTPStatus(err, 404) || (legacy && isHTTPStatus(err, 400)) {
 			return blobManifest{}, &storage.BlobNotFoundError{Key: logicalKey}
 		}
 		if ctx.Err() != nil {

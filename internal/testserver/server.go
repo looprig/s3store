@@ -67,6 +67,7 @@ type Server struct {
 	abortedUploads  []string
 	objectHeaders   map[string][]http.Header
 	pageLimit       int
+	segmentLimit    int
 	ranges          []string
 	rangeIfMatches  []string
 	corruptPayloads []string
@@ -222,6 +223,30 @@ func (s *Server) PutRaw(bucket, key string, body []byte) {
 	s.mu.Unlock()
 }
 
+// RefuseSegmentsOver emulates MinIO, which answers any object request whose
+// key has a '/'-delimited segment longer than limit with 400
+// XMinioInvalidObjectName (a HEAD carries the status only). Zero disables it.
+func (s *Server) RefuseSegmentsOver(limit int) {
+	s.mu.Lock()
+	s.segmentLimit = limit
+	s.mu.Unlock()
+}
+
+// MoveRaw relocates one stored object to another key without going through
+// the SDK. It reports whether the source existed. Tests use it to reproduce a
+// row an earlier release wrote under a key this release no longer derives.
+func (s *Server) MoveRaw(bucket, from, to string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.objects[objectID(bucket, from)]
+	if !ok {
+		return false
+	}
+	delete(s.objects, objectID(bucket, from))
+	s.objects[objectID(bucket, to)] = stored
+	return true
+}
+
 // CorruptNextPayload mutates the next payload PUT after reading it. Supported
 // modes are "truncate", "flip", and "extend".
 func (s *Server) CorruptNextPayload(mode string) {
@@ -279,7 +304,16 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		commitFailure = &current
 		s.commitFaults[operation] = queued[1:]
 	}
+	segmentLimit := s.segmentLimit
 	s.mu.Unlock()
+	if segmentLimit > 0 && key != "" {
+		for _, segment := range strings.Split(key, "/") {
+			if len(segment) > segmentLimit {
+				writeError(writer, http.StatusBadRequest, "XMinioInvalidObjectName")
+				return
+			}
+		}
+	}
 	if blocked != nil {
 		close(blocked.started)
 		_, _ = io.Copy(io.Discard, request.Body)
