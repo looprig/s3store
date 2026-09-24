@@ -6,6 +6,19 @@ capability. It deliberately does not implement Ledger, Leaser, KV,
 OrderedIndex, or SessionStore. A cloud composition combines this provider
 with the structured primitives from `pgstore`.
 
+It conforms to the `github.com/looprig/storage` v0.7.0 contract, including its
+nested-name Blobs cases (a key and a key extending it with `/…` coexist), and
+runs storage's shared `BlobReaderLifecycle` conformance suite.
+
+## Install
+
+```sh
+go get github.com/looprig/s3store@latest
+```
+
+It sits in tier 1 of the Looprig graph (foundation adapters); its only Looprig
+dependency is `github.com/looprig/storage`.
+
 `Open` validates configuration and constructs lazy AWS SDK clients without
 contacting an endpoint. `Put` streams into a uniquely-owned payload while
 hashing, verifies the committed length and SHA-256 through bounded immutable
@@ -27,13 +40,13 @@ foreign or malformed keys.
 one segment, byte-identical to v0.1.x, so every object those releases wrote on
 any service is still addressed directly. A longer key was written by v0.1.x as
 one over-long segment, which only a service without a segment limit (AWS S3)
-accepted; MinIO refused it, so no such object exists there. This release still
-honours those AWS-S3 rows: `Get` falls back to the v0.1.x key, `List` decodes
+accepted; MinIO refused it, so no such object exists there. v0.2.0 and later
+still honour those AWS-S3 rows: `Get` falls back to the v0.1.x key, `List` decodes
 both shapes (and returns each logical key once), `Delete` removes both, and
 `Put` treats an existing v0.1.x row as the blob's value (identical bytes succeed,
 different bytes are `BlobConflictError`), so the value of a key never changes.
 A 400 answer to the v0.1.x key is read as absence, because a service that
-refuses the key could never have stored it; a 400 for a key this release writes
+refuses the key could never have stored it; a 400 for a key v0.2.0 and later write
 remains a backend error. One residual risk on AWS S3: an existing object can also
 answer HEAD 400 (for example when STS credentials expire between two requests of
 one `Put`), and if that happens on the legacy lookup of a key that holds a
@@ -44,7 +57,7 @@ bytes issues one extra HEAD, and every `Put` of such a key issues one. No
 migration is required.
 
 **The upgrade is ONE-WAY on AWS S3 for keys over 191 bytes.** v0.1.x cannot see
-a row this release writes for such a key: a v0.1.x `Get` answers not found and a
+a row v0.2.0 and later write for such a key: a v0.1.x `Get` answers not found and a
 v0.1.x `List` silently omits it, and a v0.1.x `Put` can then publish a second,
 different value under the old key. Therefore:
 
@@ -72,7 +85,7 @@ are validated before SDK construction.
 The Storage contract does not require a caller to put a deadline on its
 context, and SessionStore's consumers do not (Host opens its store on
 `context.WithoutCancel`). v0.1.x refused every such call with
-`DeadlineRequiredError`. This release bounds it instead: `Open`, `Put`, `Get`,
+`DeadlineRequiredError`. Since v0.2.0 such a call is bounded instead: `Open`, `Put`, `Get`,
 `Delete` and `List` run under `Options.DefaultOperationTimeout` (default
 `DefaultOperationTimeout`, 30s) when the context has no deadline.
 
@@ -280,9 +293,14 @@ cannot see.
 
 ## Development
 
+The baseline is Go 1.26.8. Verify the module standalone, never against a
+workspace:
+
 ```sh
-make check
 GOWORK=off go test ./...
+make check              # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, build
+make test-integration   # GOWORK=off go test -tags integration -race ./...
+make test-minio         # integration && minio tests against a disposable MinIO (Docker)
 ```
 
 `make check` also runs `vet`, `staticcheck`, and `gosec` under the `integration`
@@ -294,3 +312,12 @@ tenant isolation, encryption headers, multipart retry and abort, cancellation,
 paging, range bounds, integrity failures, and concurrent immutable publication.
 `cloud`-tagged tests are excluded from both paths and contact a service this
 repository does not start.
+
+`make test-minio` runs `scripts/minio-test.sh`, which starts a MinIO container
+pinned by digest, runs the `integration && minio` tests (`TestMinIO*`) against
+it with `S3STORE_MINIO_*` settings, and removes the container. It needs Docker
+and `curl`. `scripts/mutation-test.sh` runs the mutation campaign.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
