@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.110.0
-	github.com/looprig/storage v0.6.1
+	github.com/looprig/storage v0.7.0
 )
 
 require (
