@@ -293,7 +293,7 @@ cannot see.
 
 ## Development
 
-The baseline is Go 1.26.8. Verify the module standalone, never against a
+The baseline is Go 1.26.9. Verify the module standalone, never against a
 workspace:
 
 ```sh

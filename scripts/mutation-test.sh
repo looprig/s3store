@@ -177,7 +177,7 @@ for operation in Put Get Delete List; do
 	run_mutation blob "$operation default bound" blob.go "guard.Bound(ctx, \"Blobs.$operation\", s.options.operationTimeout)" "guard.Bound(ctx, \"Blobs.$operation\", 1<<62)" TestHungBackendReturnsWithinTheDefaultBound "$operation did not return within"
 done
 
-run_mutation deps "replace directive" go.mod 'go 1.26.8' 'go 1.26.8
+run_mutation deps "replace directive" go.mod 'go 1.26.9' 'go 1.26.9
 
 replace example.test/absent-module v1.0.0 => example.test/absent-module v1.0.1' TestDependencyBoundary 'replace directives, want none'
 run_mutation deps "extra direct module" go.mod 'github.com/aws/smithy-go v1.28.1 // indirect' 'github.com/aws/smithy-go v1.28.1' TestDependencyBoundary 'direct modules ='
